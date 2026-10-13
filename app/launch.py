@@ -98,6 +98,9 @@ from services import comfy_jobs as comfy_jobs_service
 from services import local_engine_api as local_engine_api_service
 from services import production_queue_api
 from services import remote_engine as remote_engine_service
+from services import engine_routing as engine_routing_service
+from services import public_cloud as public_cloud_service
+from services import upload_api as upload_api_service
 
 # Protect upgraded installations before WanGP builds its model registry.  Old
 # CivitAI imports could pair any checkpoint with any Maestro architecture; hide
@@ -10822,14 +10825,15 @@ def _enqueue_deferred_generation_preparation(body: dict) -> dict:
         job["enhancement"] = new_enhancement(body, _enhancement_settings_snapshot())
         job["message"] = "Ready — enhance when queue starts" if hold_for_queue else "Waiting — enhance before generation"
         _studio_job_archive.save(job)
+    # Where this job runs is decided once, from measured state, and stored on the
+    # job: this computer if it can generate, otherwise a peer that reported it can.
+    job["_generation_route"] = _generation_route_or_refuse(
+        body, force_local=bool(body.pop("_force_local_generation", False))
+    )
     _jobs[job_id] = job
 
     if not hold_for_queue:
-        threading.Thread(
-            target=_run_generation,
-            args=(job_id,),
-            daemon=False,
-        ).start()
+        _start_generation_worker(job_id)
     return {
         "job_id": job_id,
         "status": initial_status,
@@ -10841,6 +10845,9 @@ def _enqueue_deferred_generation_preparation(body: dict) -> dict:
 async def generate(request: Request):
     """Submit a generation job. Returns immediately with a job_id."""
     body = await request.json()
+    # A computer that cannot generate asks the ones that can before deciding, so
+    # opening the interface and pressing Generate is the whole flow.
+    await _refresh_remote_peers_if_needed()
     if _generation_request_uses_serial_auto_planner(body):
         with _studio_submission_lock:
             submission_id = str(body.get("_client_submission_id") or "")
@@ -12336,6 +12343,19 @@ async def _prepare_generation_submission(
             "ltx_window_plan": ltx_window_plan_response,
         }
 
+    # Ask the peers again if this computer cannot generate and none answered,
+    # so the first request after a boot is not refused on a stale answer.
+    await _refresh_remote_peers_if_needed()
+
+    # Decide once, from measured state, where this job will run: this computer if
+    # it can generate, otherwise a peer Maestro that reported it can
+    # (services.engine_routing). A request that nothing can run is refused here,
+    # with the reason, instead of becoming a job that fails a minute later.
+    # A local engine is never skipped while it can do the work.
+    generation_route = _generation_route_or_refuse(
+        body, force_local=bool(body.pop("_force_local_generation", False))
+    )
+
     job_id = uuid.uuid4().hex[:8]
     initial_status = "held" if hold_for_queue else "queued"
     job = {
@@ -12358,19 +12378,16 @@ async def _prepare_generation_submission(
         "error": None,
         "workspace": workspace,
         "out_dir": job_out_dir,
+        "_generation_route": generation_route,
     }
     _jobs[job_id] = job
 
     if not hold_for_queue:
-        # Non-daemon so generation survives browser disconnect during
-        # overnight runs. Held Studio jobs deliberately have no worker until
-        # the user presses Start Queue.
-        thread = threading.Thread(
-            target=_run_generation,
-            args=(job_id,),
-            daemon=False,
-        )
-        thread.start()
+        # Non-daemon so generation survives a browser disconnect during
+        # overnight runs. Held Studio jobs deliberately have no worker until the
+        # user presses Start Queue. The runner itself decides between this
+        # machine and a peer: see _start_generation_worker.
+        _start_generation_worker(job_id)
 
     response = {
         "job_id": job_id,
@@ -28888,18 +28905,32 @@ async def retry_enhanced_job(job_id: str, request: Request):
                 enhance_fidelity_retries=current_settings.get("enhance_fidelity_retries", 1),
                 enhance_fidelity_auto_continue=current_settings.get("enhance_fidelity_auto_continue", False),
             )
+        retry_params = deepcopy(record["original_params"])
         new_id = uuid.uuid4().hex[:8]
         job = {"id": new_id, "status": "queued", "show_in_gallery": True,
                "progress": 0, "step": 0, "total_steps": 0, "phase": "", "message": "Waiting",
-               "created_at": time.time(), "params": deepcopy(record["original_params"]),
+               "created_at": time.time(), "params": retry_params,
                "output_files": [], "error": None, "workspace": previous.get("workspace"),
                "out_dir": previous.get("out_dir"), "enhancement": record}
+        # A retry is an ordinary generation request: it runs here while this
+        # computer can generate and is otherwise handed to the peer that can, so
+        # enhancing a prompt does not become a local-only path on a machine
+        # without a GPU (services.engine_routing).
+        job["_generation_route"] = _generation_route(retry_params)
         _studio_job_archive.save(job)
         _jobs[new_id] = job
         previous["retry_job_id"] = new_id
         _studio_job_archive.save(previous)
-        threading.Thread(target=_run_generation, args=(new_id,), daemon=False).start()
-        return {"job_id": new_id, "status": "queued"}
+        route = job["_generation_route"]
+        if route.get("target") == engine_routing_service.NO_TARGET:
+            # Nothing measured can run it: say so now, with the reason, instead
+            # of starting a local render that is known to fail.
+            if try_start(job, message="No engine to run this job"):
+                finish_job(job, "failed", error=str(route.get("reason") or ""),
+                           message="No engine to run this job", phase="")
+        else:
+            _start_generation_worker(new_id)
+        return {"job_id": new_id, "status": job["status"]}
 
 
 @api.post("/api/v1/cancel/{job_id}")
@@ -28942,7 +28973,8 @@ def _run_held_studio_jobs(job_ids: list[str]) -> None:
             if snapshot_job(job).get("kind") == "editor_export":
                 _run_editor_export(job_id)
             else:
-                _run_generation(job_id)
+                # Serial dispatch: run it here, or on the peer that can render it.
+                _run_generation_job_now(job_id)
         except Exception as error:
             # `_run_generation` normally owns all failure publication. Keep
             # the batch moving if an unexpected exception escapes its guard.
@@ -30848,6 +30880,16 @@ def _remote_peers_root() -> str:
     return os.path.join(_app_dir, "settings", "remote_peers")
 
 
+def _public_cloud_root() -> str:
+    """Where this machine remembers the free public engines it connected to.
+
+    No secret lives here (public Spaces are keyless), so the file is an ordinary
+    record of what was measured — the connection is made again by itself whenever
+    the remembered answer has gone stale.
+    """
+    return os.path.join(_app_dir, "settings", "public_cloud")
+
+
 def _film_upload_sessions_root() -> str:
     return os.path.join(_editor_uploads_root(), ".sessions")
 
@@ -30911,7 +30953,9 @@ def _film_local_engine_capabilities() -> dict:
         "capabilities": capabilities,
         "evidence": evidence,
         "models": model_types,
-        "generation_possible": bool(status.get("generation_possible")),
+        # This report is about *this* engine, so it stays the local-only answer:
+        # the registry must never claim a local capability a peer provides.
+        "generation_possible": bool(status.get("generation_possible_here")),
         "tools": status,
     }
 
@@ -30962,6 +31006,13 @@ def _film_engine_registry():
             })
         else:
             plain_nodes.append(node)
+    # Free public engines on the internet (services.public_cloud).  They are their
+    # own provider kind and their own node id, so a public Space can never be
+    # confused with a machine the user owns — and a capability is only advertised
+    # through it while its last probe is fresh.
+    public = public_cloud_service.provider_entries(_public_cloud_root())
+    if any(entry["online"] for entry in public):
+        reachable.add("public")
     registry = engine_providers_service.build_registry(
         local_capabilities=local["capabilities"],
         local_models=local["models"] if local["capabilities"] else [],
@@ -30972,6 +31023,7 @@ def _film_engine_registry():
         },
         comfy_servers=comfy_servers,
         nodes=plain_nodes,
+        public_cloud=public,
     )
     return registry, local, reachable
 
@@ -30985,6 +31037,18 @@ def _film_remote_generation_sources() -> list[dict]:
     computer that will do the work.
     """
     return remote_engine_service.generation_sources(_remote_peers_root())
+
+
+@film_api_service.register_generation_source
+def _film_public_generation_sources() -> list[dict]:
+    """Free public engines on the internet that are connected right now.
+
+    This is what makes "generation is possible" true on a computer with no GPU and
+    no other machine of its own: the Films workspace reports the public engine and
+    says out loud that the render there approximates the recipe rather than being
+    the Maestro pipeline itself.
+    """
+    return public_cloud_service.connected_sources(_public_cloud_root())
 
 
 @api.get("/api/v1/engines")
@@ -31294,132 +31358,16 @@ async def reference_url_import(request: Request):
     return {"reference": fetched, "asset": imported}
 
 
-@api.get("/api/v1/uploads/limits")
-def upload_limits():
-    from services import upload_chunks
-
-    return {
-        "limits": upload_chunks.kind_limits(),
-        "chunk_size": upload_chunks.DEFAULT_CHUNK_SIZE,
-        "min_chunk_size": 64 * 1024,
-        "max_chunk_size": 256 * 1024 * 1024,
-        "reserve_bytes": upload_chunks.MIN_FREE_RESERVE,
-        "note": ("Limits are per media kind and configurable; see docs/FILM-STUDIO.md "
-                 "for how to raise them."),
-    }
-
-
-@api.post("/api/v1/uploads/sessions")
-async def upload_session_create(request: Request):
-    """Open a resumable upload session for a large reference file."""
-    from services import upload_chunks
-
-    body = await request.json()
-    try:
-        return await asyncio.to_thread(
-            upload_chunks.init_session,
-            _film_upload_sessions_root(),
-            filename=str(body.get("filename") or ""),
-            total_bytes=int(body.get("total_bytes") or 0),
-            content_type=str(body.get("content_type") or ""),
-            expected_sha256=str(body.get("sha256") or ""),
-            chunk_size=int(body.get("chunk_size") or upload_chunks.DEFAULT_CHUNK_SIZE),
-        )
-    except Exception as error:
-        raise _film_http_error(error) from error
-
-
-@api.get("/api/v1/uploads/sessions/{session_id}")
-def upload_session_status(session_id: str):
-    """What arrived and what is missing — the resume contract."""
-    from services import upload_chunks
-
-    try:
-        return upload_chunks.session_status(_film_upload_sessions_root(), session_id)
-    except Exception as error:
-        raise _film_http_error(error) from error
-
-
-async def _read_bounded_chunk(request: Request, limit: int) -> bytes:
-    """Read a request body without ever buffering more than ``limit`` bytes."""
-    parts: list[bytes] = []
-    total = 0
-    async for part in request.stream():
-        total += len(part)
-        if total > limit:
-            raise HTTPException(
-                status_code=413,
-                detail=f"Chunk exceeds the {limit} byte limit for this session",
-            )
-        parts.append(part)
-    return b"".join(parts)
-
-
-@api.post("/api/v1/uploads/sessions/{session_id}/chunks")
-async def upload_session_chunk(session_id: str, request: Request, index: int = 0,
-                               sha256: str = ""):
-    """Store one chunk.  The body is capped at the session's chunk size."""
-    from services import upload_chunks
-
-    root = _film_upload_sessions_root()
-    try:
-        state = upload_chunks.session_status(root, session_id)
-    except Exception as error:
-        raise _film_http_error(error) from error
-    limit = int(state.get("chunk_size") or upload_chunks.DEFAULT_CHUNK_SIZE)
-    data = await _read_bounded_chunk(request, limit)
-    try:
-        return await asyncio.to_thread(
-            upload_chunks.append_chunk, root, session_id, index, data,
-            chunk_sha256=sha256)
-    except Exception as error:
-        raise _film_http_error(error) from error
-
-
-@api.post("/api/v1/uploads/sessions/{session_id}/complete")
-async def upload_session_complete(session_id: str, request: Request):
-    """Assemble the chunks into the uploads directory, streaming."""
-    from services import upload_chunks
-
-    body = await request.json() if await request.body() else {}
-    try:
-        return await asyncio.to_thread(
-            upload_chunks.complete_session,
-            _film_upload_sessions_root(),
-            session_id,
-            final_dir=_film_uploads_root(),
-            dedup=bool(body.get("dedup", True)),
-        )
-    except Exception as error:
-        raise _film_http_error(error) from error
-
-
-@api.delete("/api/v1/uploads/sessions/{session_id}")
-def upload_session_cancel(session_id: str, keep_record: bool = True):
-    from services import upload_chunks
-
-    try:
-        return upload_chunks.cancel_session(
-            _film_upload_sessions_root(), session_id, keep_record=keep_record)
-    except Exception as error:
-        raise _film_http_error(error) from error
-
-
-@api.post("/api/v1/uploads/sessions/cleanup")
-async def upload_sessions_cleanup(request: Request):
-    """Delete finished sessions, and stale ones only when asked."""
-    from services import upload_chunks
-
-    body = await request.json() if await request.body() else {}
-    try:
-        return await asyncio.to_thread(
-            upload_chunks.cleanup_sessions,
-            _film_upload_sessions_root(),
-            older_than=float(body.get("older_than") or upload_chunks.STALE_AFTER_SECONDS),
-            include_open=bool(body.get("include_open", False)),
-        )
-    except Exception as error:
-        raise _film_http_error(error) from error
+# The chunked upload surface is a router factory in services.upload_api, so the
+# exact endpoints a delegating computer posts a request's media to are the ones a
+# test can serve (see tests/test_remote_engine.py).  Behaviour is unchanged: this
+# is the same shell, over the same services.upload_chunks storage.
+api.include_router(
+    upload_api_service.create_router(
+        sessions_root_provider=_film_upload_sessions_root,
+        uploads_root_provider=_film_uploads_root,
+    )
+)
 
 
 # ============================================================================
@@ -31548,7 +31496,7 @@ def _register_remote_engine_runner(_app=None):
         if not engines:
             return
         registered = remote_engine_service.register_remote_handlers(
-            peers_root=root, out_dir=_local_engine_out_dir()
+            peers_root=root, out_dir=_delegation_out_dir
         )
         print(f"[Remote engine] Queue runner registered for: {', '.join(registered)}")
     except Exception as error:
@@ -31556,6 +31504,817 @@ def _register_remote_engine_runner(_app=None):
 
 
 api.add_event_handler("startup", _register_remote_engine_runner)
+
+
+# ── Running a Studio/Films request where it can actually run ────────────────
+# A computer without a CUDA GPU used to be a computer that could only direct.
+# It is now one that delegates: the request keeps the Studio job the interface
+# already polls, and the render itself happens on a peer Maestro through the
+# durable production queue (services.remote_engine), whose result is downloaded
+# into this job's own workspace. Nothing here fires while the local engine can
+# do the work, and nothing is sent to a peer that did not report it can render.
+
+_DELEGATION_POLL_SECONDS = 2.0
+# How often the configured peers are asked again while the application runs.  Short
+# enough that a computer switched on after this one is usable immediately, long
+# enough that it is one small request per minute and nothing else.
+_DELEGATION_REFRESH_SECONDS = 60.0
+_PEER_REFRESH_LOCK = threading.Lock()
+_PEER_REFRESH_STARTED = False
+_PUBLIC_REFRESH_STARTED = False
+_DELEGATION_PHASES = {
+    "pending": "Waiting for the remote computer",
+    "preparing": "Remote computer preparing",
+    "running": "Rendering on the remote computer",
+    "finalizing": "Remote computer finalizing",
+}
+
+
+def _local_generation_possible() -> bool:
+    """Whether *this* computer can render on its own (a CUDA GPU in this process).
+
+    A probe that fails answers ``False`` on purpose: an unreadable engine is not
+    evidence that generation works, and a wrong "yes" would silently drop a job
+    into an engine that cannot run it.
+    """
+    try:
+        return bool(film_api_service.engine_status().get("generation_possible_here"))
+    except Exception as error:  # noqa: BLE001 - report, never crash on a probe
+        print(f"[Engines] Could not read the local engine state: {error}")
+        return False
+
+
+def _generation_route(params: dict, *, force_local: bool = False) -> dict:
+    """Where a request should run, from measured state only.
+
+    ``force_local`` is how a delegated job runs *here*: it never delegates
+    onward, so two peers can never hand the same work to each other in a circle.
+    """
+    if force_local:
+        possible = _local_generation_possible()
+        return {
+            "target": (
+                engine_routing_service.LOCAL_TARGET if possible
+                else engine_routing_service.NO_TARGET
+            ),
+            "engine": engine_routing_service.LOCAL_ENGINE,
+            "peer_id": "",
+            "peer_label": "",
+            "peer_base_url": "",
+            "public_provider_id": "",
+            "public_provider_label": "",
+            "public_provider_base_url": "",
+            "public_capability": "",
+            "public_generation_available": False,
+            "public_candidates": [],
+            "public_fidelity": "",
+            "capability": engine_routing_service.capability_for_request(params),
+            "local_generation_possible": possible,
+            "remote_generation_available": False,
+            "remote_engine": engine_routing_service.REMOTE_ENGINE,
+            "candidates": [],
+            "reason": (
+                "This computer was asked to render a delegated job but reports no "
+                "CUDA GPU in this process, so it cannot run it locally."
+            ),
+        }
+    try:
+        peers = remote_engine_service.list_peers(_remote_peers_root())
+    except Exception as error:  # noqa: BLE001 - an unreadable peer list is "no peer"
+        print(f"[Engines] Could not read the configured peers: {error}")
+        peers = []
+    return engine_routing_service.choose_target(
+        capability=engine_routing_service.capability_for_request(params),
+        local_generation_possible=_local_generation_possible(),
+        peers=peers,
+        request_params=params,
+        public_sources=_public_sources(),
+    )
+
+
+def _public_sources() -> list[dict]:
+    """Free public engines connected right now, or nothing if none is.
+
+    Never raises: "the public record is unreadable" is reported as "no public
+    engine", which is the only thing the router can honestly conclude from it.
+    """
+    try:
+        return public_cloud_service.connected_sources(_public_cloud_root())
+    except Exception as error:  # noqa: BLE001 - a broken record is not a public engine
+        print(f"[Engines] Could not read the public compute record: {error}")
+        return []
+
+
+def _generation_route_or_refuse(params: dict, *, force_local: bool = False) -> dict:
+    """The route, or a refusal naming exactly what is missing."""
+    route = _generation_route(params, force_local=force_local)
+    if route["target"] == engine_routing_service.NO_TARGET:
+        raise HTTPException(status_code=409, detail=route["reason"])
+    return route
+
+
+def _probe_peers_now(*, max_age: float) -> dict:
+    """Ask the peers and return ``{peer_id: online}``; never raises at a caller."""
+    try:
+        return remote_engine_service.refresh_stale_peers(
+            _remote_peers_root(), max_age=max_age
+        )
+    except Exception as error:  # noqa: BLE001 - a failed probe is not an app failure
+        print(f"[Engines] Could not refresh the remote computers: {error}")
+        return {}
+
+
+# Public compute is searched over the open internet, so it is looked for on a
+# schedule rather than on every request: a search costs a handful of HTTP calls and
+# a laptop that cannot generate must not pay that price each time someone presses
+# Generate.  ``force`` is what the manual action and startup use.
+_PUBLIC_CONNECT_LOCK = threading.Lock()
+_PUBLIC_CONNECT_LAST_ATTEMPT = 0.0
+_PUBLIC_CONNECT_MIN_INTERVAL = 60.0
+
+
+def _connect_public_cloud_now(*, force: bool = False, candidates: int = 10) -> dict:
+    """Look for free public engines and connect to one per capability.
+
+    Never raises at a caller: a public service being unreachable is a fact about the
+    internet, not a failure of this application.
+    """
+    global _PUBLIC_CONNECT_LAST_ATTEMPT
+    with _PUBLIC_CONNECT_LOCK:
+        now = time.time()
+        if not force and (now - _PUBLIC_CONNECT_LAST_ATTEMPT) < _PUBLIC_CONNECT_MIN_INTERVAL:
+            return {"connected": [], "attempts": [], "skipped": "checked recently"}
+        _PUBLIC_CONNECT_LAST_ATTEMPT = now
+    try:
+        return public_cloud_service.connect(
+            _public_cloud_root(), candidates_per_capability=candidates
+        )
+    except Exception as error:  # noqa: BLE001 - the internet is not this app's to promise
+        print(f"[Public compute] Could not look for a public engine: {error}")
+        return {"connected": [], "attempts": [], "error": str(error)}
+
+
+def _public_cloud_summary(result: dict) -> str:
+    """One honest line about what the automatic connection found."""
+    connected = result.get("connected") or []
+    if connected:
+        engines = []
+        for entry in connected:
+            capability = str((entry.get("capabilities") or [""])[0] or "")
+            engines.append(f"{capability} → {entry.get('space_id')}")
+        return "Free public engines connected: " + "; ".join(engines)
+    if result.get("error"):
+        return f"No public engine: {result['error']}"
+    if result.get("skipped"):
+        return "Public engines were checked a moment ago."
+    return "No free public engine is available right now; Studio and Films stay usable."
+
+
+def _connect_public_cloud_on_start(_app=None) -> None:
+    """Look for free public engines once, in the background, when the app starts.
+
+    In the background on purpose: the first paint must not wait on the internet, and
+    the answer only matters when a request is actually made.  This is the whole
+    "connects by itself" behaviour — nothing here needs to be turned on.
+    """
+
+    def _connect() -> None:
+        result = _connect_public_cloud_now(force=True)
+        print(f"[Public compute] {_public_cloud_summary(result)}")
+        for attempt in result.get("attempts") or []:
+            if attempt.get("outcome") in {"connected", "already_connected"}:
+                continue
+            print(
+                f"[Public compute] {attempt.get('capability')}: "
+                f"{attempt.get('reason') or attempt.get('outcome')}"
+            )
+
+    threading.Thread(target=_connect, daemon=True, name="maestro_public_connect").start()
+
+
+def _start_public_cloud_refresh_loop(_app=None) -> None:
+    """Keep the public connection honest while the app runs.
+
+    A free public Space can be paused, replaced or rate limited between two renders,
+    so the connection is re-measured on a timer instead of being remembered forever.
+    A few candidates per pass: the already-connected engine is kept, and the search
+    only widens when nothing is connected.
+    """
+    global _PUBLIC_REFRESH_STARTED
+    with _PUBLIC_CONNECT_LOCK:
+        if _PUBLIC_REFRESH_STARTED:
+            return
+        _PUBLIC_REFRESH_STARTED = True
+
+    def _loop() -> None:
+        while True:
+            time.sleep(_DELEGATION_REFRESH_SECONDS)
+            result = _connect_public_cloud_now(candidates=3)
+            if result.get("connected"):
+                print(f"[Public compute] {_public_cloud_summary(result)}")
+
+    threading.Thread(target=_loop, daemon=True, name="maestro_public_refresh").start()
+
+
+async def _refresh_remote_peers_if_needed() -> None:
+    """Ask the other engines again when this computer cannot generate and none answered.
+
+    The first request after a boot must work.  A peer that was switched on after
+    this machine would otherwise still be remembered as unreachable (its last
+    answer can be hours old), and the request would be refused for a reason that
+    is no longer true.  The same applies to public compute, which is nobody's
+    computer to switch on: it is looked for again here, so a request made on a
+    fresh install reaches a free public engine without anyone configuring one.
+
+    Runs off the event loop, and only ever when the answer actually changes the
+    outcome: a machine whose own GPU can generate is never held up by a network
+    probe, a peer that answered a minute ago is not asked again, and the public
+    tier is not searched again while it is already connected.
+    """
+    if _local_generation_possible():
+        return
+    try:
+        peers = remote_engine_service.list_peers(_remote_peers_root())
+    except Exception as error:  # noqa: BLE001 - "no readable peers" means no peers
+        print(f"[Engines] Could not read the configured peers: {error}")
+        peers = []
+    if not peers or not any(peer.get("online") for peer in peers):
+        await asyncio.to_thread(_probe_peers_now, max_age=0.0)
+    if not _public_sources():
+        await asyncio.to_thread(_connect_public_cloud_now)
+
+
+def _ensure_delegation_worker() -> str:
+    """Keep this machine's queue worker running while work is delegated.
+
+    The queue worker is what hands a ``node:<peer_id>`` job to the peer, so on a
+    computer that directs there is nothing for the user to start: the render was
+    asked for in Studio or Films, and this is the step that carries it out.
+    """
+    from services import queue_worker as queue_worker_service
+
+    try:
+        if queue_worker_service.worker_status().get("running"):
+            return "already running"
+        result = queue_worker_service.start_worker(_film_queue_root())
+        return "started" if result.get("started") else "already running"
+    except Exception as error:  # noqa: BLE001 - never stop a render over this
+        print(f"[Engines] Could not start the queue worker: {error}")
+        return "unavailable"
+
+
+def _delegation_out_dir(job) -> str:
+    """Where a delegated result lands: the workspace the delegated job names.
+
+    Absolute on purpose: the queue records a completed job's artefacts as paths
+    that must exist, so a relative save root must not travel any further.
+    """
+    params = job.get("params") if isinstance(job, dict) else {}
+    params = params if isinstance(params, dict) else {}
+    return os.path.abspath(_workspace_dir(str(params.get("workspace") or "")))
+
+
+def _generation_queue_task(params: dict) -> str:
+    """The queue task kind a Studio request maps to (queue.TASK_KINDS)."""
+    capability = engine_routing_service.capability_for_request(params)
+    if capability in {"image_generation", "inpainting"}:
+        return "image"
+    if capability in {"audio_generation", "voice_generation"}:
+        return "audio"
+    return "video"
+
+
+def _delegated_queue_payload(job: dict, route: dict) -> dict:
+    """The durable queue job that carries a Studio request to a peer — or an engine.
+
+    A peer is asked for its own Maestro engine (``engine_routing.REMOTE_ENGINE``)
+    because that is the engine that can run a Studio/Films parameter set.  A public
+    engine is asked for nothing of the sort: the job names the capability and the
+    provider that answered, and ``services.public_cloud`` maps the request onto that
+    Space's own inputs.  The workspace travels with the job either way, so the
+    downloaded result lands in the folder this job's gallery entry is served from.
+    """
+    params = dict(job.get("params") or {})
+    params["peer_id"] = str(route.get("peer_id") or "")
+    params["capability"] = str(route.get("capability") or "")
+    params["workspace"] = str(job.get("workspace") or "")
+    params["public_provider"] = str(route.get("public_provider_id") or "")
+    if route.get("target") != engine_routing_service.PUBLIC_TARGET:
+        params["remote_engine"] = str(
+            route.get("remote_engine") or engine_routing_service.REMOTE_ENGINE
+        )
+    return {
+        "project_id": str(params.get("project_id") or ""),
+        "shot_id": str(params.get("shot_id") or ""),
+        "task": _generation_queue_task(params),
+        "engine": str(route.get("engine") or ""),
+        "model": str(params.get("model_type") or ""),
+        "params": params,
+        "priority": int(params.get("priority") or 0),
+        # A delegated render is remote work: it must not be refused by this
+        # machine's own memory ceiling, which describes the local engine.
+        "memory_mb": 0,
+        "dedupe_key": f"maestro:{job.get('id') or ''}",
+        "cancel_supported": True,
+    }
+
+
+def _mirror_queue_job(job, queue_job_id: str, label: str) -> None:
+    """Follow a delegated queue job and publish its real outcome on the Studio job.
+
+    Only measurements are forwarded: a percentage is shown when the peer's engine
+    reported one, and the final files are the ones actually downloaded here. A job
+    whose peer is switched off stays waiting instead of failing, and a cancellation
+    is asked for and then simply stops this loop (the Studio job is already
+    published as cancelled by request_cancel).
+    """
+    from services import generation_queue as queue_service
+
+    root = _film_queue_root()
+    last_updates: dict = {}
+    while True:
+        if is_cancel_requested(job):
+            try:
+                queue_service.cancel(root, queue_job_id, reason="cancelled in Studio")
+            except Exception as error:  # noqa: BLE001 - the Studio job is already cancelled
+                print(f"[Engines] Could not cancel queue job {queue_job_id}: {error}")
+            return
+        try:
+            record = queue_service.job(root, queue_job_id)
+        except FileNotFoundError:
+            finish_job(
+                job,
+                "failed",
+                error=f"The queue no longer knows the delegated job {queue_job_id}.",
+                message="The delegated job disappeared from the queue",
+                phase="",
+            )
+            return
+        state = str(record.get("state") or "")
+        progress = record.get("progress") if isinstance(record.get("progress"), dict) else {}
+        note = str(progress.get("note") or "") or str(record.get("deferred_reason") or "")
+        updates = {"phase": _DELEGATION_PHASES.get(state, state or "Remote render")}
+        percent = progress.get("percent")
+        if isinstance(percent, (int, float)) and not isinstance(percent, bool):
+            updates["progress"] = int(percent)
+        for key in ("step", "total_steps"):
+            value = progress.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                updates[key] = value
+        # One line of text, from what the peer actually reported: its own note,
+        # or the state in words when it reported none.
+        message = note or str(updates["phase"])
+        if message:
+            updates["message"] = message
+        # A poll that learned nothing writes nothing: this loop can run for hours
+        # and a rewrite per tick would be work invented by the observer.
+        if updates != last_updates:
+            last_updates = dict(updates)
+            update_job(job, **updates)
+        if state == "completed":
+            files = [os.path.basename(str(path)) for path in (record.get("outputs") or [])]
+            if not files:
+                finish_job(
+                    job,
+                    "failed",
+                    error="The remote job finished without reporting an output file.",
+                    message="Remote render produced no file",
+                    phase="",
+                )
+                return
+            update_job(job, output_files=files, progress=100, step=0, total_steps=0)
+            finish_job(
+                job,
+                "completed",
+                output_files=files,
+                progress=100,
+                phase="",
+                message=f"Rendered on {label}",
+            )
+            return
+        if state == "failed":
+            errors = record.get("errors") if isinstance(record.get("errors"), list) else []
+            finish_job(
+                job,
+                "failed",
+                error=str(errors[-1])[:400] if errors else "the remote render failed",
+                message="Remote render failed",
+                phase="",
+            )
+            return
+        if state == "cancelled":
+            return
+        time.sleep(_DELEGATION_POLL_SECONDS)
+
+
+def _hand_over_to_queue(job, route: dict, label: str) -> bool:
+    """Put a request in the durable queue under the engine that will run it.
+
+    This is the half both remote tiers share: the job is stored *here*, so a peer
+    that is switched off or a public service that is out of quota defers it instead
+    of losing it.  Returns whether the hand-over happened; a failure is recorded on
+    the Studio job, since a request that could not even be queued is that job's
+    failure and not something to hide.
+    """
+    from services import generation_queue as queue_service
+
+    try:
+        submitted = queue_service.submit(_film_queue_root(), _delegated_queue_payload(job, route))
+        queue_job_id = str((submitted.get("job") or {}).get("job_id") or "")
+        if not queue_job_id:
+            raise RuntimeError("the queue accepted the job but returned no job id")
+        job["_delegation"] = {
+            "peer_id": str(route.get("peer_id") or ""),
+            "peer_label": label,
+            "queue_job_id": queue_job_id,
+        }
+        _studio_job_archive.save(job)
+        update_job(
+            job,
+            message=f"Sent to {label} as queue job {queue_job_id}",
+            phase="Remote render",
+        )
+        # The queue worker is what actually hands the job over. It is started
+        # here because this path exists precisely so that the user does not have
+        # to start it by hand on a computer that cannot render locally.
+        _ensure_delegation_worker()
+    except Exception as error:  # noqa: BLE001 - a failed hand-over is the job's failure
+        finish_job(
+            job,
+            "failed",
+            error=str(error)[:300],
+            message="Could not queue the remote job",
+            phase="",
+        )
+        return False
+    _mirror_queue_job(job, queue_job_id, label)
+    return True
+
+
+def _run_delegated_generation(job_id: str) -> None:
+    """Render one Studio job on the peer that can, and mirror it back here.
+
+    The Studio job remains the object the interface polls and the Films project
+    records; the work is a durable queue job (``engine = node:<peer_id>``) that
+    this machine's own queue worker hands to the peer, so a peer that is switched
+    off defers the render instead of losing it.
+    """
+    job = _jobs.get(job_id)
+    if job is None:
+        return
+    route = dict(job.get("_generation_route") or {})
+    peer_id = str(route.get("peer_id") or "")
+    label = str(route.get("peer_label") or peer_id)
+    if not try_start(job, message=f"Queued for {label}"):
+        return
+    if not peer_id:
+        finish_job(
+            job,
+            "failed",
+            error=str(route.get("reason") or "No remote computer was chosen."),
+            message="No engine to run this job",
+            phase="",
+        )
+        return
+    # The peer stores the job; only its own worker renders it.  Prep that computer
+    # before handing the work over, so nobody has to sit at the machine with the
+    # GPU (its worker action is idempotent and its own documented endpoint).
+    readiness = remote_engine_service.ensure_peer_worker(_remote_peers_root(), peer_id)
+    if readiness.get("started"):
+        update_job(job, message=f"Started {label}'s queue worker")
+    elif not readiness.get("online"):
+        print(f"[Engines] {label} did not answer: {readiness.get('reason')}")
+    _hand_over_to_queue(job, route, label)
+
+
+def _run_public_generation(job_id: str) -> None:
+    """Render one Studio job on a free public engine, and mirror it back here.
+
+    Same shape as the peer path — one durable queue job, mirrored progress, the file
+    downloaded into this workspace — with one difference that matters: nothing here
+    prepares the other side, because the other side is nobody's computer.  The job
+    names ``public:<capability>``; ``services.public_cloud`` picks the connected
+    public Space and falls back to another one if that Space breaks mid-render.
+    """
+    job = _jobs.get(job_id)
+    if job is None:
+        return
+    route = dict(job.get("_generation_route") or {})
+    label = str(
+        route.get("public_provider_label")
+        or route.get("public_provider_id")
+        or "a free public engine"
+    )
+    if not try_start(job, message=f"Queued for {label}"):
+        return
+    update_job(
+        job,
+        message=(
+            f"Sent to {label} — a free public engine on the internet. It runs its own "
+            "model, so this render approximates the Maestro recipe."
+        ),
+        phase="Remote render",
+    )
+    _hand_over_to_queue(job, route, label)
+
+
+def _run_generation_job_now(job_id: str) -> None:
+    """Run one Studio job here, or delegate it — blocking, for serial dispatchers."""
+    job = _jobs.get(job_id)
+    route = dict((job or {}).get("_generation_route") or {})
+    if route.get("target") == engine_routing_service.REMOTE_TARGET:
+        _run_delegated_generation(job_id)
+        return
+    if route.get("target") == engine_routing_service.PUBLIC_TARGET:
+        _run_public_generation(job_id)
+        return
+    _run_generation(job_id)
+
+
+def _start_generation_worker(job_id: str) -> None:
+    """Start the runner this job needs: the local engine, a peer, or a public one."""
+    job = _jobs.get(job_id)
+    route = dict((job or {}).get("_generation_route") or {})
+    target = str(route.get("target") or "")
+    if target == engine_routing_service.REMOTE_TARGET:
+        threading.Thread(
+            target=_run_delegated_generation,
+            args=(job_id,),
+            daemon=False,
+            name=f"maestro_delegate_{job_id}",
+        ).start()
+        return
+    if target == engine_routing_service.PUBLIC_TARGET:
+        threading.Thread(
+            target=_run_public_generation,
+            args=(job_id,),
+            daemon=False,
+            name=f"maestro_public_{job_id}",
+        ).start()
+        return
+    threading.Thread(target=_run_generation, args=(job_id,), daemon=False).start()
+
+
+def _run_queued_generation_locally(job, context) -> list:
+    """Render a *delegated* Studio request on this computer's GPU.
+
+    Registered for the ``maestro`` engine, which is what a delegated job asks for
+    (``engine_routing.REMOTE_ENGINE``). It is deliberately a local runner: it never
+    delegates onward, so a group of peers cannot pass one job around in a circle.
+    Progress forwarded to the delegating computer is this engine's own measurement.
+    """
+    from services.queue_worker import JobCancelled
+
+    if not _local_generation_possible():
+        context.fail(
+            "This computer was asked to render a delegated job but reports no CUDA GPU "
+            "in this process, so it cannot run it.",
+            retryable=False,
+        )
+        return []
+    params = dict(job.get("params") or {})
+    params.pop("peer_id", None)
+    params.pop("remote_engine", None)
+    params.pop("capability", None)
+    params["_force_local_generation"] = True
+    try:
+        submitted = asyncio.run(_prepare_generation_submission(params))
+    except HTTPException as error:
+        context.fail(str(error.detail)[:400], retryable=False)
+        return []
+    except Exception as error:  # noqa: BLE001 - report the real reason to the caller
+        context.fail(f"{type(error).__name__}: {error}"[:400], retryable=True)
+        return []
+    studio_id = str(submitted.get("job_id") or "")
+    if not studio_id:
+        context.fail("The delegated request produced no generation job.", retryable=False)
+        return []
+    context.link(studio_id)
+    last_reported = None
+    while True:
+        live = _jobs.get(studio_id)
+        if live is None:
+            context.fail("The generation job disappeared on this computer.", retryable=True)
+            return []
+        if context.cancelled():
+            request_cancel(live)
+            raise JobCancelled("Cancelled while rendering a delegated job")
+        snapshot = snapshot_job(live)
+        status = str(snapshot.get("status") or "")
+        percent = snapshot.get("progress")
+        step = snapshot.get("step")
+        total_steps = snapshot.get("total_steps")
+        reported = (
+            int(percent) if isinstance(percent, (int, float)) else None,
+            step if isinstance(step, int) else None,
+            total_steps if isinstance(total_steps, int) else None,
+            str(snapshot.get("message") or "")[:200],
+        )
+        # The engine's own measurement, forwarded once per change — a tick that
+        # learned nothing is not progress, and must not become a queue write.
+        if reported != last_reported:
+            last_reported = reported
+            context.report(
+                percent=reported[0],
+                step=reported[1],
+                total_steps=reported[2],
+                note=reported[3],
+            )
+        if status == "completed":
+            break
+        if status in {"failed", "cancelled"}:
+            context.fail(
+                str(snapshot.get("error") or f"the render was {status}")[:400],
+                retryable=False,
+            )
+            return []
+        time.sleep(_DELEGATION_POLL_SECONDS)
+    directory = str(snapshot.get("out_dir") or _workspace_dir(str(snapshot.get("workspace") or "")))
+    # Absolute paths: the queue accepts a completed job only with real files it
+    # can point at, so a relative save root must be resolved here.
+    files = [
+        os.path.abspath(os.path.join(directory, os.path.basename(str(name))))
+        for name in (snapshot.get("output_files") or [])
+    ]
+    files = [path for path in files if os.path.isfile(path)]
+    if not files:
+        context.fail(
+            "The render finished but produced no file on this computer's disk.",
+            retryable=False,
+        )
+        return []
+    return files
+
+
+def _register_public_generation_queue_handler(_app=None) -> None:
+    """Let a queued job run on a free public engine on the internet.
+
+    A handler is registered for every capability public compute *can* serve, whether
+    or not anything is connected at that moment: the handler asks at run time and
+    defers the job when no public engine is reachable, so a job that names a public
+    engine never dies because the internet was busy when it was queued.
+    """
+    try:
+        registered = public_cloud_service.register_public_handlers(
+            _public_cloud_root(), out_dir=_delegation_out_dir
+        )
+        print(
+            "[Public compute] Queue runners registered: " + ", ".join(registered)
+            + " (a public Space is chosen at run time)"
+        )
+    except Exception as error:  # noqa: BLE001 - never stop startup over this
+        print(f"[Public compute] Could not register the queue runners: {error}")
+
+
+def _register_local_generation_queue_handler(_app=None) -> None:
+    """Let another Maestro render a Studio/Films request on this machine's GPU."""
+    try:
+        from services import queue_worker as queue_worker_service
+
+        queue_worker_service.register_handler(
+            engine_routing_service.REMOTE_ENGINE,
+            _run_queued_generation_locally,
+            replace=True,
+        )
+        print(
+            f"[Engines] Queue handler '{engine_routing_service.REMOTE_ENGINE}' registered: "
+            "another Maestro can delegate Studio/Films generation to this computer."
+        )
+    except Exception as error:  # noqa: BLE001 - never stop startup over this
+        print(f"[Engines] Could not register the local generation queue handler: {error}")
+
+
+def _resume_delegated_jobs(_app=None) -> None:
+    """Re-attach to renders that were delegated before this backend restarted.
+
+    The queue job is the durable half of a delegated render, so after a restart it
+    is still there (or already finished). Without this, a Studio job would sit at
+    its last known state with nothing following the queue job it started.
+    """
+    from services import generation_queue as queue_service
+
+    root = _film_queue_root()
+    if any(
+        isinstance(job, dict)
+        and (
+            isinstance(job.get("_delegation"), dict)
+            or snapshot_job(job).get("status") in {"queued", "running"}
+            and str((job.get("_generation_route") or {}).get("target") or "")
+            in {engine_routing_service.REMOTE_TARGET, engine_routing_service.PUBLIC_TARGET}
+        )
+        for job in list(_jobs.values())
+    ):
+        # Work that was asked for on this computer is still owed to it: the worker
+        # that hands it to the peer has to be running after a restart too.
+        print(f"[Engines] Delegated work found; queue worker: {_ensure_delegation_worker()}")
+    for job_id, job in list(_jobs.items()):
+        delegation = job.get("_delegation") if isinstance(job, dict) else None
+        if not isinstance(delegation, dict):
+            continue
+        queue_job_id = str(delegation.get("queue_job_id") or "")
+        if not queue_job_id:
+            continue
+        status = str(snapshot_job(job).get("status") or "")
+        if status not in {"queued", "running"}:
+            continue
+        try:
+            queue_service.job(root, queue_job_id)
+        except FileNotFoundError:
+            if try_start(job, message="The delegated job is gone from the queue"):
+                finish_job(
+                    job,
+                    "failed",
+                    error=f"The queue no longer knows the delegated job {queue_job_id}.",
+                    message="The delegated job disappeared from the queue",
+                    phase="",
+                )
+            continue
+        label = str(delegation.get("peer_label") or delegation.get("peer_id") or "the peer")
+        print(f"[Engines] Resuming delegated job {queue_job_id} ({job_id}) on {label}")
+        threading.Thread(
+            target=_mirror_queue_job,
+            args=(job, queue_job_id, label),
+            daemon=False,
+            name=f"maestro_delegate_{job_id}",
+        ).start()
+
+
+def _start_peer_refresh_loop(_app=None) -> None:
+    """Ask the configured peers again, on a timer, for as long as the app runs.
+
+    Reachability is measured, never assumed — so it has to be re-measured.  That
+    is what lets a request work the minute it is made instead of a minute after
+    someone presses Probe, and it is why opening the interface needs no step of
+    its own on the computer that cannot generate.
+    """
+    global _PEER_REFRESH_STARTED
+    with _PEER_REFRESH_LOCK:
+        if _PEER_REFRESH_STARTED:
+            return
+        _PEER_REFRESH_STARTED = True
+
+    def _loop() -> None:
+        while True:
+            time.sleep(_DELEGATION_REFRESH_SECONDS)
+            answers = _probe_peers_now(max_age=remote_engine_service.PEER_REFRESH_AFTER)
+            if answers:
+                online = [peer_id for peer_id, reached in answers.items() if reached]
+                print(
+                    f"[Engines] Remote computers refreshed: {len(online)} of "
+                    f"{len(answers)} answered"
+                    + (f" ({', '.join(online)})" if online else "")
+                )
+
+    threading.Thread(
+        target=_loop, daemon=True, name="maestro_peer_refresh"
+    ).start()
+
+
+def _probe_remote_peers_on_start(_app=None) -> None:
+    """Ask every configured peer once, in the background, when the app starts.
+
+    Off the startup path on purpose: a peer that is switched off must not delay
+    booting, and the answer is only needed when a request is made.
+    """
+    try:
+        configured = remote_engine_service.list_peers(_remote_peers_root())
+    except Exception as error:  # noqa: BLE001 - an unreadable list is "no peers"
+        print(f"[Engines] Could not read the configured peers: {error}")
+        return
+    if not configured:
+        return
+
+    def _probe() -> None:
+        answers = _probe_peers_now(max_age=0.0)
+        if not answers:
+            return
+        online = [peer_id for peer_id, reached in answers.items() if reached]
+        print(
+            f"[Engines] Remote computers: {len(online)} of {len(answers)} answered"
+            + (f" ({', '.join(online)})" if online else "")
+            + ". Studio and Films delegate generation to one that can render."
+        )
+        # A computer that answered is asked to have its own queue worker running,
+        # so the very next render it is given starts without anyone touching it.
+        for peer_id in online:
+            readiness = remote_engine_service.ensure_peer_worker(
+                _remote_peers_root(), peer_id
+            )
+            if readiness.get("started"):
+                print(f"[Engines] Started the queue worker on {peer_id}.")
+            elif not readiness.get("online"):
+                print(f"[Engines] {peer_id}: {readiness.get('reason')}")
+
+    threading.Thread(target=_probe, daemon=True, name="maestro_peer_probe").start()
+
+
+api.add_event_handler("startup", _register_local_generation_queue_handler)
+api.add_event_handler("startup", _register_public_generation_queue_handler)
+api.add_event_handler("startup", _probe_remote_peers_on_start)
+api.add_event_handler("startup", _start_peer_refresh_loop)
+api.add_event_handler("startup", _connect_public_cloud_on_start)
+api.add_event_handler("startup", _start_public_cloud_refresh_loop)
+api.add_event_handler("startup", _resume_delegated_jobs)
 
 
 @api.get("/api/v1/engines/remote/peers")
@@ -31590,7 +32349,7 @@ async def remote_peers_add(request: Request):
         root = _remote_peers_root()
         record = remote_engine_service.add_peer(root, body)
         registered = remote_engine_service.register_remote_handlers(
-            peers_root=root, out_dir=_local_engine_out_dir(), engines=(record["engine_id"],)
+            peers_root=root, out_dir=_delegation_out_dir, engines=(record["engine_id"],)
         )
         probe = await asyncio.to_thread(
             remote_engine_service.probe_peer,
@@ -31621,7 +32380,7 @@ async def remote_peers_update(peer_id: str, request: Request):
         root = _remote_peers_root()
         updated = remote_engine_service.update_peer(root, peer_id, body)
         remote_engine_service.register_remote_handlers(
-            peers_root=root, out_dir=_local_engine_out_dir(), engines=(updated["engine_id"],)
+            peers_root=root, out_dir=_delegation_out_dir, engines=(updated["engine_id"],)
         )
         return {"peer": updated, "engines": remote_engine_service.engines_for_peers(root)}
     except Exception as error:
@@ -31717,6 +32476,124 @@ async def remote_engine_queue_job(request: Request):
         }
     except Exception as error:
         raise _remote_http_error(error) from error
+
+
+# ============================================================================
+# Public compute: a free engine on the internet, connected by itself
+# ============================================================================
+# The third place a render can run.  Nothing here needs to be configured: Maestro
+# asks the public Hugging Face Hub which Spaces are running on free shared GPU
+# hardware right now, connects to one that declares the task, and keeps the
+# connection honest on a timer.  services.public_cloud owns the logic; these routes
+# only translate JSON, and none of them is required for the feature to work.
+
+
+def _public_http_error(error: Exception) -> HTTPException:
+    if isinstance(error, FileNotFoundError):
+        return HTTPException(status_code=404, detail=str(error))
+    if isinstance(error, public_cloud_service.PublicCloudError):
+        return HTTPException(status_code=400, detail=str(error))
+    return _film_http_error(error)
+
+
+@api.get("/api/v1/engines/public/providers")
+def public_cloud_providers():
+    """The public engines this computer connected to, and what routes to them."""
+    try:
+        root = _public_cloud_root()
+        providers = public_cloud_service.list_providers(root)
+        return {
+            "providers": providers,
+            "sources": public_cloud_service.connected_sources(root),
+            "searches": public_cloud_service.searches(root),
+            "served_capabilities": list(public_cloud_service.SERVED_CAPABILITIES),
+            "policy": {
+                "kind": "public_cloud",
+                "protocol": (
+                    "A public Gradio Space's own API, called anonymously over HTTPS "
+                    "(no key of ours is ever sent)."
+                ),
+                "discovery": (
+                    "The public Hub is asked which Spaces are RUNNING on free ZeroGPU "
+                    "hardware for the capability, and each candidate's own /info is read "
+                    "before it is used."
+                ),
+                "quota": (
+                    "Free anonymous GPU time is shared and small; signing Hugging Face in "
+                    "(the launcher's optional Hugging Face action) uses that free account's "
+                    "larger allowance. No Maestro account and no API key are involved."
+                ),
+                "fidelity": (
+                    "A public Space runs its own model with its own defaults, so a render "
+                    "there approximates the Maestro recipe. It is used only when this "
+                    "computer cannot generate and no peer can either."
+                ),
+            },
+        }
+    except Exception as error:
+        raise _public_http_error(error) from error
+
+
+@api.post("/api/v1/engines/public/connect")
+async def public_cloud_connect(request: Request):
+    """Look for free public engines now, instead of waiting for the next check."""
+    body = await request.json() if await request.body() else {}
+    capabilities = body.get("capabilities") if isinstance(body.get("capabilities"), list) else None
+    try:
+        result = await asyncio.to_thread(
+            lambda: public_cloud_service.connect(
+                _public_cloud_root(),
+                capabilities=capabilities,
+                candidates_per_capability=int(body.get("candidates") or 10),
+            )
+        )
+        return {
+            **result,
+            "summary": _public_cloud_summary(result),
+            "sources": public_cloud_service.connected_sources(_public_cloud_root()),
+        }
+    except Exception as error:
+        raise _public_http_error(error) from error
+
+
+@api.post("/api/v1/engines/public/providers/{provider_id:path}/probe")
+async def public_cloud_probe(provider_id: str, request: Request):
+    """Ask one public engine again; reachability is measured, never assumed."""
+    body = await request.json() if await request.body() else {}
+    try:
+        return await asyncio.to_thread(
+            public_cloud_service.probe_provider,
+            _public_cloud_root(),
+            provider_id,
+            timeout=float(body.get("timeout") or public_cloud_service.DEFAULT_TIMEOUT),
+        )
+    except Exception as error:
+        raise _public_http_error(error) from error
+
+
+@api.post("/api/v1/engines/public/spaces")
+async def public_cloud_add_space(request: Request):
+    """Point Maestro at one particular public Space instead of the automatic pick."""
+    body = await request.json()
+    try:
+        return await asyncio.to_thread(
+            public_cloud_service.add_space,
+            _public_cloud_root(),
+            str(body.get("space") or ""),
+            capability=str(body.get("capability") or ""),
+            timeout=float(body.get("timeout") or public_cloud_service.DEFAULT_TIMEOUT),
+        )
+    except Exception as error:
+        raise _public_http_error(error) from error
+
+
+@api.delete("/api/v1/engines/public/providers/{provider_id:path}")
+def public_cloud_forget(provider_id: str):
+    """Forget a public engine here.  Nothing changes on the public service."""
+    try:
+        return public_cloud_service.forget_provider(_public_cloud_root(), provider_id)
+    except Exception as error:
+        raise _public_http_error(error) from error
 
 
 # ============================================================================

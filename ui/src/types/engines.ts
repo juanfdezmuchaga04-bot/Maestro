@@ -130,6 +130,99 @@ export interface ComputeAssignments {
   parked: Array<{ job_id: string; node_id: string; state: string; capability?: string }>
 }
 
+export interface RemotePeerInfo {
+  peer_id: string
+  label: string
+  base_url: string
+  engine: string
+  capabilities: string[]
+  capabilities_source: 'declared' | 'probe'
+  models: string[]
+  notes: string
+  /** The peer's token is stored on this computer and never returned. */
+  token_set: boolean
+  online: boolean
+  online_ttl_seconds: number
+  last_probe: Record<string, unknown> | null
+  added_at: number | null
+  updated_at: number | null
+  engine_id: string
+}
+
+export interface RemotePeersResponse {
+  peers: RemotePeerInfo[]
+  engines: string[]
+  generation_sources: Array<{
+    kind: string
+    peer_id: string
+    label: string
+  }>
+  policy: { kind: string; protocol: string; token: string; note: string }
+}
+
+/** One free public Space on the internet, as it was measured. */
+export interface PublicProviderInfo {
+  provider_id: string
+  space_id: string
+  label: string
+  base_url: string
+  kind: 'hf_space'
+  hardware: string
+  /** Always free; a public Space never asks this computer for a key. */
+  free: boolean
+  requires_key: boolean
+  capabilities: string[]
+  endpoints: Record<string, { api_name?: string; exact?: boolean; media_kinds?: string[] }>
+  accepts_media: boolean
+  online: boolean
+  online_ttl_seconds: number
+  last_probe: Record<string, unknown> | null
+  engine_ids: string[]
+  likes: number
+  notes: string
+}
+
+export interface PublicSourceInfo {
+  kind: string
+  provider_id: string
+  label: string
+  base_url: string
+  hardware: string
+  capabilities: string[]
+  accepts_media: boolean
+  online: boolean
+  free: boolean
+  requires_key: boolean
+  /** `public_approximation`: a public engine's own model, not this pipeline. */
+  fidelity: string
+  engine_ids: string[]
+  likes: number
+  notes: string
+}
+
+export interface PublicProvidersResponse {
+  providers: PublicProviderInfo[]
+  sources: PublicSourceInfo[]
+  searches: Record<string, { at: number; terms: string[]; found: string[] }>
+  served_capabilities: string[]
+  policy: {
+    kind: string
+    protocol: string
+    discovery: string
+    quota: string
+    fidelity: string
+  }
+}
+
+export interface PublicConnectResult {
+  connected: PublicProviderInfo[]
+  attempts: Array<{ capability: string; outcome: string; space_id?: string; reason?: string }>
+  connected_count: number
+  providers: PublicProviderInfo[]
+  sources: PublicSourceInfo[]
+  summary: string
+}
+
 export interface UploadLimits {
   limits: Record<string, number>
   chunk_size: number

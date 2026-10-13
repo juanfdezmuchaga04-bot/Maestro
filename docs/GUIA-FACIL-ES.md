@@ -12,13 +12,16 @@ termina con una frase del tipo **«vas bien si…»** para que sepas que no te h
 ## Antes de empezar: la idea en 3 frases
 
 1. **Maestro vive en tu ordenador.** No es una web en la nube: el programa, tus
-   proyectos y el motor que crea vídeos están en tu PC.
+   proyectos y (si tu tarjeta puede) el motor que crea vídeos están en tu PC.
 2. **El móvil es un mando a distancia.** Sirve para mirar, preparar y lanzar cosas.
 3. **Para generar vídeo, el ordenador tiene que estar encendido** con Maestro abierto.
    Si está apagado, el móvil se abre igual pero te dirá que no llega al ordenador.
 
-Y lo importante: **nada se sube a internet, no hay que crear ninguna cuenta de Maestro
-y no se paga por generar.** Solo usas tus propios recursos.
+Y lo importante: **no hay que crear ninguna cuenta de Maestro, no se paga por generar y
+no se sube nada tuyo a internet.** Si tu ordenador no puede generar por sí mismo (no
+tiene tarjeta NVIDIA, o se la presta a otro equipo), Maestro busca solo una **máquina
+pública y gratuita** en internet (Parte 4B) o manda el trabajo al ordenador con tarjeta
+que tú le indiques — en los dos casos sin que tengas que hacer nada.
 
 ## Lo que necesitas (comprueba esto primero)
 
@@ -231,6 +234,42 @@ propio Maestro ajusta los valores a tu tarjeta la primera vez.
 
 ---
 
+# PARTE 4B — ¿Tu ordenador no puede generar? Cómputo público gratis
+
+Si tu equipo no tiene una tarjeta NVIDIA (o es un Mac), Maestro **no se queda tirado**:
+busca por su cuenta una máquina pública gratuita en internet y genera ahí. No hay que
+instalar nada, ni crear ninguna cuenta, ni pegar ninguna clave.
+
+1. Que Maestro esté en **Start** (como siempre).
+2. Escribe tu prompt y pulsa generar, igual que en la Parte 4.
+3. La primera generación puede tardar bastante: hay una **cola** de gente usando la misma
+   máquina pública. El panel te va diciendo en qué punto estás.
+4. El resultado aparece en tu galería y queda en tu ordenador, en `outputs/`.
+
+**Vas bien si…** en **Studio → Compute & transfer → Public compute (internet)** aparece
+una máquina pública conectada (con una bolita verde) y dice **free**.
+
+### Tres cosas que conviene saber
+
+- Es un motor **de otra persona**: usa su propio modelo, así que el vídeo se *parece* a lo
+  que Maestro haría con tus ajustes, pero no es exactamente lo mismo. Por eso Maestro
+  siempre prefiere tu ordenador o un ordenador con tarjeta que le indiques, y esta opción
+  es la última.
+- El tiempo gratis es **compartido y corto** (unos minutos por día). Si se agota, el
+  trabajo **no se pierde**: se queda esperando y se reintenta solo.
+- Si quieres más tiempo gratis, entra en el menú de Pinokio y pulsa **Connect Hugging Face
+  (Optional)**: usa tu cuenta gratuita de Hugging Face (no es una cuenta de Maestro y no
+  se paga). Todo sigue funcionando igual.
+
+Detalle completo (en inglés): [`PUBLIC-COMPUTE.md`](PUBLIC-COMPUTE.md).
+
+**Si tienes otro ordenador con tarjeta** y prefieres usarlo a él, es aún mejor: en
+**Studio → Compute & transfer → Remote computers with a GPU** añade ese ordenador (su
+nombre de Tailscale y la contraseña `MAESTRO_ACCESS_TOKEN` que pusiste en él). Maestro lo
+usará automáticamente, le mandará tus fotos de referencia y te traerá el vídeo terminado.
+
+---
+
 # PARTE 5 (opcional, ya para nivel medio) — El motor local ComfyUI
 
 Maestro puede además usar un motor propio (ComfyUI + Wan 2.2) que se instala en el mismo
@@ -263,6 +302,8 @@ Detalle completo en [`COMFYUI-LOCAL.md`](COMFYUI-LOCAL.md).
 | Chrome no me ofrece «Install app» | La dirección tiene que empezar por `https://` y hay que haber entrado con la contraseña antes. |
 | Todo va lentísimo o da error de memoria | Tu tarjeta es pequeña: usa clips cortos, menos resolución y un modelo más ligero. |
 | Un vídeo no se termina de montar | Seguramente falta **ffmpeg** en el ordenador. El doctor te lo dice y te da el enlace. |
+| No tengo tarjeta NVIDIA y no sé qué hacer | No hagas nada: Maestro usa cómputo público gratis solo (Parte 4B). Si tarda, es la cola de la máquina pública, no un error. |
+| Dice que se ha agotado el tiempo gratis | El trabajo se queda esperando y se reintenta solo. Para más tiempo gratis, **Connect Hugging Face (Optional)** en el menú de Pinokio. |
 | Quiero empezar de cero | En Pinokio, **Reset**. Tus proyectos en `outputs/` se conservan. |
 | Quiero ver qué está pasando | En Pinokio, la página **Logs** de Maestro. |
 
@@ -284,4 +325,6 @@ pierden: se ejecutan cuando el motor vuelve.
    de **Settings → Notifications**.
 5. Abre esa dirección en Chrome del móvil, entra con la contraseña y pulsa
    **⋮ → Install app**.
-6. En Maestro, escribe un prompt y genera. La primera vez espera: baja el modelo.
+6. En Maestro, escribe un prompt y genera. La primera vez espera: baja el modelo (y, si
+   tu ordenador no tiene tarjeta NVIDIA, genera en una máquina pública gratuita que
+   Maestro conecta sola).

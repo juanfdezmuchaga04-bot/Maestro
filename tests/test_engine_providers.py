@@ -200,6 +200,46 @@ class BuildRegistryTest(unittest.TestCase):
         self.assertTrue(status["local_only"])
         self.assertEqual(status["providers"][0]["kind"], "local_engine")
 
+    def test_a_free_public_engine_is_its_own_kind_and_never_needs_a_key(self):
+        registry = build_registry(
+            public_cloud=[{
+                "provider_id": "hf-space:owner/space",
+                "label": "owner/space (public Hugging Face Space) — free public GPU",
+                "capabilities": ["text_to_video", "image_generation"],
+                "online": True,
+                "hardware": "zero-a10g",
+                "address": "https://owner-space.hf.space",
+            }],
+        )
+        provider = registry.get("hf-space:owner/space")
+        self.assertEqual(provider.kind, "public_cloud")
+        self.assertFalse(provider.local)
+        self.assertFalse(provider.requires_api_key)
+        self.assertEqual(provider.node_id, "public")
+        self.assertEqual(provider.detail["hardware"], "zero-a10g")
+        # Free, public and reachable, so it resolves without any commercial switch.
+        self.assertEqual(registry.resolve("text_to_video").provider_id, "hf-space:owner/space")
+        self.assertTrue(registry.status()["local_only"])
+
+    def test_a_public_engine_ranks_below_anything_the_user_owns(self):
+        registry = build_registry(
+            nodes=[{"node_id": "desktop", "capabilities": ["text_to_video"]}],
+            public_cloud=[{
+                "provider_id": "hf-space:owner/space",
+                "capabilities": ["text_to_video"],
+                "online": True,
+            }],
+        )
+        self.assertEqual(
+            [p["provider_id"] for p in registry.list(capability="text_to_video")],
+            ["node:desktop", "hf-space:owner/space"],
+        )
+        self.assertEqual(registry.resolve("text_to_video").provider_id, "node:desktop")
+
+    def test_an_entry_without_a_provider_id_is_skipped_not_guessed(self):
+        registry = build_registry(public_cloud=[{"capabilities": ["text_to_video"]}])
+        self.assertEqual([p["provider_id"] for p in registry.list()], ["local:maestro"])
+
     def test_registering_a_commercial_adapter_flips_local_only_off(self):
         registry = build_registry(
             commercial=[{

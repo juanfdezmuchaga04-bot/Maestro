@@ -117,7 +117,7 @@ silencioso a otro motor.
 | --- | --- |
 | `app/services/access_gate.py` | Acepta `Authorization: Bearer <MAESTRO_ACCESS_TOKEN>` **solo en modo token** (`accepts_bearer()`), comparado con `hmac.compare_digest` |
 | `app/services/production_queue_api.py` | Dos endpoints nuevos: `GET …/jobs/{id}/outputs` (lista por índice: nombre, tipo, tamaño, presente) y `GET …/jobs/{id}/outputs/{index}` (streaming en trozos acotados, `206` con `Range`, `416` si el rango no es válido). La ruta nunca la propone el cliente |
-| `app/services/film_api.py` | `register_generation_source()`: el estado de motor reporta las **fuentes remotas** que responden (`remote_sources`, `remote_generation_available`) sin cambiar el significado de `generation_possible`, que sigue midiendo si *este* flujo puede lanzar un render. Así un portátil sin GPU dice la verdad (no puede él, pero hay un equipo configurado) y **no** se habilita un botón que fallaría |
+| `app/services/film_api.py` | `register_generation_source()`: el estado de motor reporta las **fuentes remotas** que responden (`remote_sources`, `remote_generation_available`). Desde la Fase 3 `generation_possible` significa «se puede enviar un render desde aquí y ejecutarse de verdad» (aquí o en un par), y `generation_possible_here` conserva la respuesta local. Así un portátil sin GPU dice la verdad y el botón que se habilita es uno que funciona — porque encola en el par automáticamente |
 | `app/launch.py` | Registro del handler remoto al arrancar; los pares entran en `_film_engine_registry` como proveedores `compute_node` (con `node_id = peer_id`); fuente de generación remota registrada; y seis endpoints nuevos (ver §3) |
 | `tests/test_access_gate.py` | 2 pruebas nuevas: el bearer autentica en modo token (y no crea sesión de navegador) y **nunca** se acepta en modo contraseña |
 | `tests/test_production_queue_api.py` | La superficie documentada pasa de 19 a 21 rutas, con las dos de entrega de resultados |
@@ -247,15 +247,27 @@ generación (que no se puede medir aquí: no hay GPU).
 
 ## 6. Lo que **no** está hecho (declarado, no disimulado)
 
-1. **La UI todavía no cablea la delegación en los flujos de Studio/Films.** El
-   botón "generar planos" sigue enviando al motor **local**
-   (`_prepare_generation_submission`), que en el portátil no puede ejecutar nada.
-   Hoy la delegación se usa por API (`/api/v1/engines/remote/queue-job`) y la
-   cola/estado ya son los definitivos. Cablear los flujos a `node:<peer_id>` y
-   añadir el panel de pares es el siguiente paso (Fase 3).
-2. **El worker de la cola no arranca solo.** Es explícito a propósito (igual que
-   hoy): hay que llamar a `POST /api/v1/production/queue/worker/start` en los dos
-   equipos. La respuesta de `queue-job` indica si está corriendo.
+1. ~~**La UI todavía no cablea la delegación en los flujos de Studio/Films.**~~
+   **Resuelto (Fase 3).** `app/services/engine_routing.py` decide una vez, desde
+   el estado medido, dónde corre cada petición, y `app/launch.py` actúa: si el
+   motor local puede, se ejecuta aquí; si no, el trabajo va a un par que **informó**
+   que puede renderizar (`node:<peer_id>`, con `params.remote_engine = maestro`) y
+   el resultado se descarga en el workspace de ese mismo trabajo. El botón de
+   Studio y el de Films ya no fallan por no tener GPU: encolan solos. Un trabajo
+   que nada puede ejecutar se rechaza con `409` y el motivo. Los medios que lleva
+   la petición (frame inicial, referencias, vídeo/sonido de control) **viajan al
+   par** antes que el trabajo, por sus propias sesiones de subida, y los parámetros
+   se reescriben a las copias que ese equipo ya tiene; un fichero que no se puede
+   enviar detiene el envío y el error lo nombra. El panel de pares vive en *Studio
+   → Compute & transfer → Remote computers with a GPU*. Detalles y límites en
+   [`STUDIO-NODES.md`](STUDIO-NODES.md).
+2. ~~**El worker de la cola no arranca solo.**~~ **Resuelto (Fase 3):** al entregar
+   un trabajo, esta máquina pide al par que arranque su propio worker
+   (`POST /api/v1/production/queue/worker/start`, idempotente), y en el arranque
+   hace lo mismo con cada par configurado que responda. En el equipo sin GPU sigue
+   siendo implícito: lo arranca el camino de delegación, porque es el paso que
+   entrega el trabajo. `MAESTRO_ACCESS_TOKEN` en el par sigue siendo el único
+   ajuste manual, y no hay que tocar nada más en ese equipo.
 3. **No se ha contactado ningún peer real.** `launch.py` no arranca en este
    contenedor (faltan dependencias del runtime fijado: `git`, `easydict`, … y no hay
    GPU), así que los seis endpoints nuevos están **compilados y revisados**, pero no
@@ -277,12 +289,14 @@ generación (que no se puede medir aquí: no hay GPU).
 
 ## 7. Siguiente fase propuesta (Fase 3)
 
-1. **Cablear los flujos a la delegación**: cuando el motor local no pueda ejecutar
-   (sin GPU o sin modelos), que Studio/Films encolen con `engine = node:<peer_id>`
-   y capacidad declarada, sin cambiar la experiencia de usuario.
-2. **Panel de pares** en *Studio → Compute & transfer*: alta, sonda, estado
-   (online/offline), capacidades medidas y último trabajo; con el token en
-   `*_set` y nunca devuelto al cliente.
+1. ~~**Cablear los flujos a la delegación**~~ y ~~**panel de pares**~~:
+   **hechos** (Fase 3). Ver `app/services/engine_routing.py`, los ayudantes de
+   delegación en `app/launch.py` y la sección *Remote computers with a GPU* del
+   panel de Compute. También hecho: **transferir los medios de entrada** (frame
+   inicial, referencias, vídeo/sonido de control) mediante las sesiones de subida
+   del par, con comprobación SHA-256 y deduplicación por contenido, y **estado de
+   pares siempre fresco** (sonda al arrancar, cada minuto, y en el momento en que
+   una petición iba a rechazarse por no haber par).
 3. **Adaptador de IA uniforme**: extender a todas las capacidades lo que hoy solo
    tienen algunas (timeouts, errores homogéneos, validación de entrada/salida,
    límites de consumo, telemetría sin secretos).

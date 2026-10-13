@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   AlertTriangle,
   CheckCircle2,
+  Cloud,
   Copy,
   Cpu,
   Keyboard,
@@ -15,15 +16,24 @@ import {
   Users,
 } from 'lucide-react'
 import {
+  addPublicSpace,
+  addRemotePeer,
   cancelComfyRun,
+  connectPublicCloud,
   fetchComfyRun,
   fetchComfyTemplates,
   fetchComputeAssignments,
   fetchEngines,
+  fetchPublicProviders,
+  fetchRemotePeers,
+  forgetPublicProvider,
   probeComfyUi,
+  probePublicProvider,
+  probeRemotePeer,
   recoverComputeNode,
   registerComputeNode,
   removeComputeNode,
+  removeRemotePeer,
   runComfyTemplate,
 } from '../api/engines'
 import type { ComfyRunState } from '../api/engines'
@@ -33,6 +43,8 @@ import type {
   ComfyProbeResult,
   ComfyTemplateDetail,
   EnginesStatus,
+  PublicProvidersResponse,
+  RemotePeerInfo,
 } from '../types/engines'
 
 /**
@@ -667,6 +679,582 @@ function ComfyProbeCard({ onRegistered }: { onRegistered: () => void }) {
   )
 }
 
+/**
+ * What a peer's own report says about its queue worker, in one sentence appended
+ * to a probe result. A peer whose worker is stopped still accepts a job into its
+ * queue — the render simply waits there, which is the one thing worth saying out
+ * loud when a computer is registered for delegation.
+ */
+function workerNotice(probe: Record<string, unknown> | null | undefined): string {
+  if (!probe || probe.queue_worker_running !== false) return ''
+  return ' Its queue worker is not running, so a delegated render waits there until you start it.'
+}
+
+/**
+ * Free public compute over the internet — the engine for a computer that has no
+ * GPU and no second machine to borrow. Nothing here needs configuring: Maestro asks
+ * the public Hub which Spaces are running on free shared GPU hardware right now,
+ * connects to one that declares the task, and re-checks on a timer. A public Space
+ * runs its own model, so a render there *approximates* the Maestro recipe, which is
+ * why a peer is still preferred when one exists.
+ */
+function PublicComputeSection({ onChanged }: { onChanged: () => void }) {
+  const [data, setData] = useState<PublicProvidersResponse | null>(null)
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState('')
+  const [open, setOpen] = useState(false)
+  const [form, setForm] = useState({ space: '', capability: 'text_to_video' })
+
+  const refresh = useCallback(async () => {
+    try {
+      setData(await fetchPublicProviders())
+      setError('')
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }, [])
+
+  useEffect(() => {
+    void refresh()
+  }, [refresh])
+
+  const connect = useCallback(async () => {
+    setBusy('connect')
+    setError('')
+    setNotice('')
+    try {
+      const result = await connectPublicCloud({ candidates: 10 })
+      setNotice(result.summary)
+      await refresh()
+      onChanged()
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setBusy('')
+    }
+  }, [refresh, onChanged])
+
+  const probe = useCallback(
+    async (providerId: string) => {
+      setBusy(providerId)
+      setError('')
+      setNotice('')
+      try {
+        const result = await probePublicProvider(providerId)
+        setNotice(
+          result.provider.online
+            ? `${result.provider.space_id} answered: ${result.provider.capabilities.join(', ') || 'no capability reported'}.`
+            : `${result.provider.space_id} did not answer. Maestro will look for another running Space.`,
+        )
+        await refresh()
+        onChanged()
+      } catch (err) {
+        setError((err as Error).message)
+      } finally {
+        setBusy('')
+      }
+    },
+    [refresh, onChanged],
+  )
+
+  const forget = useCallback(
+    async (providerId: string) => {
+      setBusy(providerId)
+      setError('')
+      setNotice('')
+      try {
+        const result = await forgetPublicProvider(providerId)
+        setNotice(result.note)
+        await refresh()
+        onChanged()
+      } catch (err) {
+        setError((err as Error).message)
+      } finally {
+        setBusy('')
+      }
+    },
+    [refresh, onChanged],
+  )
+
+  const add = useCallback(async () => {
+    setBusy('add')
+    setError('')
+    setNotice('')
+    try {
+      const result = await addPublicSpace({
+        space: form.space.trim(),
+        capability: form.capability,
+      })
+      setNotice(
+        result.provider.online
+          ? `${result.provider.space_id} can run ${form.capability.replace(/_/g, ' ')}.`
+          : `${result.provider.space_id} did not answer with an endpoint for that task, so nothing will be sent to it.`,
+      )
+      setForm({ space: '', capability: form.capability })
+      setOpen(false)
+      await refresh()
+      onChanged()
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setBusy('')
+    }
+  }, [form, refresh, onChanged])
+
+  const providers = data?.providers || []
+  const sources = data?.sources || []
+  const empty = (data?.served_capabilities || []).filter(
+    capability => !sources.some(source => source.capabilities.includes(capability)),
+  )
+
+  return (
+    <section className="rounded-xl border border-border bg-bg-secondary p-4">
+      <div className="flex items-center gap-2">
+        <Cloud size={15} className="text-accent-warm" />
+        <h2 className="text-sm font-semibold text-text-primary">Public compute (internet)</h2>
+      </div>
+      <p className="mt-1 text-xs text-text-muted">
+        A free engine you do not have to own, install or sign into. Maestro asks the public Hub
+        which Spaces are running on free shared GPU hardware right now, connects to one that
+        declares the task, and re-checks it on a timer — so a computer with no GPU and no second
+        machine can still render. It is used only after this computer and any connected computer
+        have had their turn, and the public Space runs its own model, so the render approximates
+        the Maestro recipe rather than replaying it. Free shared GPU time is small; signing
+        Hugging Face in with the launcher's optional action uses that free account's larger
+        allowance, and no key of yours is ever sent.
+      </p>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={() => void connect()}
+          disabled={busy !== ''}
+          className="flex items-center gap-1.5 rounded-lg bg-accent-warm px-3 py-2 text-xs font-medium text-black disabled:opacity-40"
+        >
+          {busy === 'connect' ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+          {busy === 'connect' ? 'Looking for a free engine…' : 'Connect now'}
+        </button>
+        <span className="text-[11px] text-text-muted">
+          {sources.length > 0
+            ? `${sources.length} public engine(s) connected`
+            : 'not connected yet — Maestro keeps looking on its own'}
+        </span>
+      </div>
+
+      {providers.length === 0 ? (
+        <p className="mt-3 text-[11px] text-text-muted">
+          No public engine connected yet. Studio and Films still work, and any request that needs a
+          render will look for one before it is refused.
+        </p>
+      ) : (
+        <ul className="mt-3 flex flex-col gap-3">
+          {providers.map(provider => (
+            <li key={provider.provider_id} className="rounded-lg border border-border bg-bg-tertiary p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span
+                  className={`h-2.5 w-2.5 shrink-0 rounded-full ${
+                    provider.online ? 'bg-accent-green' : 'bg-text-muted'
+                  }`}
+                  title={provider.online ? 'answered a recent probe' : 'not answering'}
+                />
+                <span className="text-xs font-medium text-text-primary">{provider.space_id}</span>
+                <span className="rounded-md border border-border px-1.5 py-0.5 text-[10px] text-text-muted">
+                  {provider.hardware || 'free GPU'}
+                </span>
+                <span className="rounded-md border border-accent-green/40 px-1.5 py-0.5 text-[10px] text-text-secondary">
+                  free
+                </span>
+                <span className="ml-auto flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => void probe(provider.provider_id)}
+                    disabled={busy === provider.provider_id}
+                    className="flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-hover hover:text-text-primary disabled:opacity-40"
+                  >
+                    {busy === provider.provider_id ? (
+                      <Loader2 size={11} className="animate-spin" />
+                    ) : (
+                      <RefreshCw size={11} />
+                    )}
+                    Probe
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void forget(provider.provider_id)}
+                    disabled={busy === provider.provider_id}
+                    className="flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-hover hover:text-text-primary disabled:opacity-40"
+                  >
+                    <Trash2 size={11} /> Forget
+                  </button>
+                </span>
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                {provider.capabilities.map(capability => (
+                  <span
+                    key={capability}
+                    className="rounded-md border border-accent-warm/40 bg-accent-warm/10 px-1.5 py-0.5 text-[10px] text-text-primary"
+                  >
+                    {capability.replace(/_/g, ' ')}
+                    {provider.endpoints?.[capability]?.api_name
+                      ? ` · ${provider.endpoints[capability].api_name}`
+                      : ''}
+                  </span>
+                ))}
+              </div>
+              <div className="mt-1 text-[10px] text-text-muted">
+                {provider.accepts_media ? 'can receive a start frame · ' : ''}
+                last answered <RelativeTime value={((provider.last_probe || {}).at as number) ?? null} />
+                {' · '}
+                this computer's worker sends the job
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {empty.length > 0 && providers.length > 0 && (
+        <p className="mt-2 text-[10px] text-text-muted">
+          Nothing is connected right now for: {empty.map(name => name.replace(/_/g, ' ')).join(', ')}.
+          Maestro asks the public Hub again on its own; those requests wait instead of failing.
+        </p>
+      )}
+
+      <button
+        type="button"
+        onClick={() => setOpen(value => !value)}
+        className="mt-3 flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-text-secondary hover:bg-bg-hover hover:text-text-primary"
+      >
+        <Plug size={13} /> {open ? 'Cancel' : 'Use one particular public Space'}
+      </button>
+
+      {open && (
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+          <input
+            value={form.space}
+            onChange={event => setForm({ ...form, space: event.target.value })}
+            placeholder="owner/space or https://…hf.space"
+            className="rounded-lg border border-border bg-bg-tertiary px-3 py-2.5 text-sm text-text-primary placeholder:text-text-muted focus:border-accent-warm focus:outline-none"
+          />
+          <select
+            value={form.capability}
+            onChange={event => setForm({ ...form, capability: event.target.value })}
+            className="rounded-lg border border-border bg-bg-tertiary px-3 py-2.5 text-sm text-text-primary focus:border-accent-warm focus:outline-none"
+          >
+            {(data?.served_capabilities || []).map(capability => (
+              <option key={capability} value={capability}>
+                {capability.replace(/_/g, ' ')}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            onClick={() => void add()}
+            disabled={!form.space.trim() || busy === 'add'}
+            className="rounded-lg bg-accent-warm px-3 py-2.5 text-xs font-medium text-black disabled:opacity-40 sm:col-span-2"
+          >
+            {busy === 'add' ? 'Reading that Space’s own API…' : 'Add and probe'}
+          </button>
+          <p className="text-[10px] text-text-muted sm:col-span-2">
+            The Space is probed before it is used, so one that cannot run the task is reported
+            instead of receiving work.
+          </p>
+        </div>
+      )}
+
+      {notice && (
+        <p className="mt-2 flex items-start gap-2 rounded-lg border border-accent-green/40 bg-accent-green/10 p-2.5 text-[11px] text-text-primary">
+          <CheckCircle2 size={12} className="mt-0.5 shrink-0 text-accent-green" />
+          <span className="flex-1">{notice}</span>
+        </p>
+      )}
+      {error && (
+        <p className="mt-2 flex items-start gap-2 rounded-lg border border-chip-red/40 bg-chip-red/10 p-2.5 text-[11px] text-text-primary">
+          <AlertTriangle size={12} className="mt-0.5 shrink-0 text-chip-red" />
+          <span className="flex-1">{error}</span>
+        </p>
+      )}
+    </section>
+  )
+}
+
+/**
+ * Remote computers — another Maestro on the private network that renders what
+ * this one queues, and hands the finished files back into this workspace. A peer
+ * counts as online only while its last probe is fresh, and its capabilities come
+ * from its own report or from what you declared; the token is stored on this
+ * computer and is never returned by the API.
+ */
+function RemotePeersSection({ onChanged }: { onChanged: () => void }) {
+  const [peers, setPeers] = useState<RemotePeerInfo[]>([])
+  const [engines, setEngines] = useState<string[]>([])
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState('')
+  const [open, setOpen] = useState(false)
+  const [form, setForm] = useState({ peerId: '', label: '', baseUrl: '', token: '' })
+
+  const refresh = useCallback(async () => {
+    try {
+      const data = await fetchRemotePeers()
+      setPeers(data.peers)
+      setEngines(data.engines)
+      setError('')
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }, [])
+
+  useEffect(() => {
+    void refresh()
+  }, [refresh])
+
+  const add = useCallback(async () => {
+    setBusy('add')
+    setError('')
+    setNotice('')
+    try {
+      const result = await addRemotePeer({
+        peerId: form.peerId.trim(),
+        label: form.label.trim() || undefined,
+        baseUrl: form.baseUrl.trim(),
+        token: form.token.trim() || undefined,
+      })
+      setNotice(
+        result.online
+          ? `${result.peer.label} answered and can render what it reported.${workerNotice(result.probe)}`
+          : `${result.peer.label} was saved, but it did not answer yet: jobs wait for it instead of failing.`,
+      )
+      setForm({ peerId: '', label: '', baseUrl: '', token: '' })
+      setOpen(false)
+      await refresh()
+      onChanged()
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setBusy('')
+    }
+  }, [form, refresh, onChanged])
+
+  const probe = useCallback(
+    async (peerId: string) => {
+      setBusy(peerId)
+      setError('')
+      setNotice('')
+      try {
+        const result = await probeRemotePeer(peerId)
+        setNotice(
+          result.online
+            ? `${result.peer.label} answered: ${result.peer.capabilities.join(', ') || 'no capability reported'}.${workerNotice(result.probe)}`
+            : `${result.peer.label} did not answer. Jobs stay queued until it does.`,
+        )
+        await refresh()
+        onChanged()
+      } catch (err) {
+        setError((err as Error).message)
+      } finally {
+        setBusy('')
+      }
+    },
+    [refresh, onChanged],
+  )
+
+  const forget = useCallback(
+    async (peerId: string) => {
+      setBusy(peerId)
+      setError('')
+      setNotice('')
+      try {
+        const result = await removeRemotePeer(peerId)
+        setNotice(result.note)
+        await refresh()
+        onChanged()
+      } catch (err) {
+        setError((err as Error).message)
+      } finally {
+        setBusy('')
+      }
+    },
+    [refresh, onChanged],
+  )
+
+  return (
+    <section className="rounded-xl border border-border bg-bg-secondary p-4">
+      <div className="flex items-center gap-2">
+        <Server size={15} className="text-accent-warm" />
+        <h2 className="text-sm font-semibold text-text-primary">Remote computers with a GPU</h2>
+      </div>
+      <p className="mt-1 text-xs text-text-muted">
+        A peer is another Maestro on your private network. When this computer cannot generate — no
+        CUDA GPU — Studio and Films queue the work on that computer's own engine and download the
+        result back here, so the gallery, the storyboard and the editor see it like any other render.
+        Saving a peer is the whole setup: from then on the peers are asked again automatically, the
+        queue worker on the computer with the GPU is started when work is handed over, and the media
+        a request brings from here (a start frame, references, a control video) is sent to that
+        computer before the job, so it renders the same video. If that computer is off, the job waits
+        instead of failing.
+      </p>
+
+      {peers.length === 0 ? (
+        <p className="mt-3 text-[11px] text-text-muted">
+          No remote computer configured. Add the machine that has the GPU — the address it is reachable
+          at (its Tailscale name, or its LAN address) and the token you set there as
+          {' '}
+          <span className="font-mono text-text-secondary">MAESTRO_ACCESS_TOKEN</span>.
+        </p>
+      ) : (
+        <ul className="mt-3 flex flex-col gap-3">
+          {peers.map(peer => {
+            // Measured, not assumed: the peer's own report says whether its queue
+            // worker is running. A stopped worker is why a delegated render would
+            // arrive there and wait, so it is shown instead of left to be guessed.
+            const workerStopped =
+              peer.online &&
+              (peer.last_probe as { queue_worker_running?: boolean } | null)?.queue_worker_running === false
+            return (
+            <li key={peer.peer_id} className="rounded-lg border border-border bg-bg-tertiary p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span
+                  className={`h-2.5 w-2.5 shrink-0 rounded-full ${
+                    peer.online ? 'bg-accent-green' : 'bg-text-muted'
+                  }`}
+                  title={peer.online ? 'answered a recent probe' : 'not answering'}
+                />
+                <span className="text-xs font-medium text-text-primary">{peer.label}</span>
+                <span className="text-[10px] text-text-muted">{peer.base_url}</span>
+                {!peer.token_set && (
+                  <span className="rounded-md border border-indicator-warning/40 px-1.5 py-0.5 text-[10px] text-text-primary">
+                    no token
+                  </span>
+                )}
+                <span className="ml-auto flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => void probe(peer.peer_id)}
+                    disabled={busy === peer.peer_id}
+                    className="flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-hover hover:text-text-primary disabled:opacity-40"
+                  >
+                    {busy === peer.peer_id ? (
+                      <Loader2 size={11} className="animate-spin" />
+                    ) : (
+                      <RefreshCw size={11} />
+                    )}
+                    Probe
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void forget(peer.peer_id)}
+                    disabled={busy === peer.peer_id}
+                    className="flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-hover hover:text-text-primary disabled:opacity-40"
+                  >
+                    <Trash2 size={11} /> Forget
+                  </button>
+                </span>
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                {peer.capabilities.length === 0 ? (
+                  <span className="text-[10px] text-text-muted">
+                    No capability reported yet — probe it.
+                  </span>
+                ) : (
+                  peer.capabilities.map(capability => (
+                    <span
+                      key={capability}
+                      className="rounded-md border border-accent-warm/40 bg-accent-warm/10 px-1.5 py-0.5 text-[10px] text-text-primary"
+                    >
+                      {capability.replace(/_/g, ' ')}
+                    </span>
+                  ))
+                )}
+              </div>
+              <div className="mt-1 text-[10px] text-text-muted">
+                Queue engine {peer.engine_id} · this computer's worker hands jobs over
+              </div>
+              {workerStopped && (
+                <p className="mt-1.5 flex items-start gap-1.5 text-[10px] text-text-secondary">
+                  <AlertTriangle size={11} className="mt-0.5 shrink-0 text-indicator-warning" />
+                  <span>
+                    That computer answered, but its own queue worker is not running: the next render
+                    sent to it starts it there automatically. To start it now, use Probe or send a
+                    render.
+                  </span>
+                </p>
+              )}
+            </li>
+            )
+          })}
+        </ul>
+      )}
+
+      {engines.length > 0 && (
+        <p className="mt-2 text-[10px] text-text-muted">
+          Delegation engines registered here: {engines.join(', ')}
+        </p>
+      )}
+
+      <button
+        type="button"
+        onClick={() => setOpen(value => !value)}
+        className="mt-3 flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-text-secondary hover:bg-bg-hover hover:text-text-primary"
+      >
+        <Plug size={13} /> {open ? 'Cancel' : 'Add a remote computer'}
+      </button>
+
+      {open && (
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+          <input
+            value={form.peerId}
+            onChange={event => setForm({ ...form, peerId: event.target.value })}
+            placeholder="id (e.g. desk-1)"
+            className="rounded-lg border border-border bg-bg-tertiary px-3 py-2.5 text-sm text-text-primary placeholder:text-text-muted focus:border-accent-warm focus:outline-none"
+          />
+          <input
+            value={form.label}
+            onChange={event => setForm({ ...form, label: event.target.value })}
+            placeholder="label (e.g. PC with RTX 4070)"
+            className="rounded-lg border border-border bg-bg-tertiary px-3 py-2.5 text-sm text-text-primary placeholder:text-text-muted focus:border-accent-warm focus:outline-none"
+          />
+          <input
+            value={form.baseUrl}
+            onChange={event => setForm({ ...form, baseUrl: event.target.value })}
+            placeholder="https://pc.tailnet.ts.net"
+            className="rounded-lg border border-border bg-bg-tertiary px-3 py-2.5 text-sm text-text-primary placeholder:text-text-muted focus:border-accent-warm focus:outline-none"
+          />
+          <input
+            value={form.token}
+            onChange={event => setForm({ ...form, token: event.target.value })}
+            placeholder="MAESTRO_ACCESS_TOKEN of that computer"
+            type="password"
+            className="rounded-lg border border-border bg-bg-tertiary px-3 py-2.5 text-sm text-text-primary placeholder:text-text-muted focus:border-accent-warm focus:outline-none"
+          />
+          <button
+            type="button"
+            onClick={() => void add()}
+            disabled={!form.peerId.trim() || !form.baseUrl.trim() || busy === 'add'}
+            className="rounded-lg bg-accent-warm px-3 py-2.5 text-xs font-medium text-black disabled:opacity-40 sm:col-span-2"
+          >
+            {busy === 'add' ? 'Probing that computer…' : 'Add and probe'}
+          </button>
+        </div>
+      )}
+
+      {notice && (
+        <p className="mt-2 flex items-start gap-2 rounded-lg border border-accent-green/40 bg-accent-green/10 p-2.5 text-[11px] text-text-primary">
+          <CheckCircle2 size={12} className="mt-0.5 shrink-0 text-accent-green" />
+          <span className="flex-1">{notice}</span>
+        </p>
+      )}
+      {error && (
+        <p className="mt-2 flex items-start gap-2 rounded-lg border border-chip-red/40 bg-chip-red/10 p-2.5 text-[11px] text-text-primary">
+          <AlertTriangle size={12} className="mt-0.5 shrink-0 text-chip-red" />
+          <span className="flex-1">{error}</span>
+        </p>
+      )}
+    </section>
+  )
+}
+
+
 export function StudioComputePanel() {
   const [status, setStatus] = useState<EnginesStatus | null>(null)
   const [nodes, setNodes] = useState<ComputeNodeInfo[]>([])
@@ -730,6 +1318,8 @@ export function StudioComputePanel() {
 
       {status && <CapabilityTable status={status} />}
 
+      <PublicComputeSection onChanged={() => void refresh()} />
+
       <section className="rounded-xl border border-border bg-bg-secondary p-4">
         <div className="flex items-center gap-2">
           <Users size={15} className="text-accent-warm" />
@@ -758,6 +1348,7 @@ export function StudioComputePanel() {
       </section>
 
       <RegisterNodeForm onChanged={() => void refresh()} />
+      <RemotePeersSection onChanged={() => void refresh()} />
       <ComfyProbeCard onRegistered={() => void refresh()} />
     </div>
   )

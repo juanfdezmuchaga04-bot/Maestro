@@ -59,15 +59,21 @@ lista de dependencias del código.
 
 ## Generar desde un Mac
 
-El Mac **dirige**; la GPU está en otro equipo. Dos caminos soportados:
+El Mac **dirige**; la GPU está en otro equipo, o en una máquina pública. Tres caminos
+soportados:
 
+- **Cómputo público gratis (automático)** — sin configurar nada: Maestro busca una máquina
+  pública gratuita en internet y la usa cuando no hay nada mejor. Ver
+  [`PUBLIC-COMPUTE.md`](PUBLIC-COMPUTE.md).
 - **Nodos de cómputo** — registra un equipo con NVIDIA como nodo (token propio) y encola
   desde Studio. Ver [`STUDIO-NODES.md`](STUDIO-NODES.md).
 - **Motor local remoto (ComfyUI)** — apunta Maestro a la URL de la máquina con GPU. Ver
   [`COMFYUI-LOCAL.md`](COMFYUI-LOCAL.md) y el panel *Studio → Compute & transfer*.
 
-En ambos casos el Mac conserva el proyecto, el storyboard, la cola, la biblioteca y el
-montaje: la generación sólo ocurre fuera.
+En los tres casos el Mac conserva el proyecto, el storyboard, la cola, la biblioteca y el
+montaje: la generación sólo ocurre fuera. El orden es siempre el mismo — este equipo, un
+equipo tuyo con tarjeta, y por último la máquina pública — porque un equipo con GPU
+ejecuta tu receta exacta y la máquina pública ejecuta su propio modelo.
 
 ## Usar Maestro desde tu iPhone o iPad
 

@@ -645,11 +645,60 @@ class AssemblyApiTest(StudioApiTestBase):
         self.assertEqual(reopened["exports"][0]["status"], "queued")
         self.assertEqual(reopened["jobs"][0]["kind"], "export")
 
-    def test_engine_status_reports_capabilities_without_pretending(self):
+    def test_engine_status_separates_the_local_engine_from_a_remote_one(self):
         status = film_api.engine_status()
-        for key in ("gpu", "ffmpeg", "ffprobe", "generation_possible"):
+        for key in (
+            "gpu",
+            "ffmpeg",
+            "ffprobe",
+            "generation_possible",
+            "generation_possible_here",
+            "remote_generation_available",
+        ):
             self.assertIsInstance(status[key], bool)
-        self.assertEqual(status["generation_possible"], status["gpu"])
+        # "Here" is the narrow, local-only answer; "possible" answers the question
+        # the production screens ask — can a render be submitted and actually run.
+        self.assertEqual(status["generation_possible_here"], status["gpu"])
+        self.assertEqual(status["remote_generation_available"], bool(status["remote_sources"]))
+        self.assertEqual(
+            status["generation_possible"],
+            bool(status["generation_possible_here"]) or bool(status["remote_generation_available"]),
+        )
+        if not status["remote_sources"]:
+            self.assertEqual(status["generation_possible"], status["gpu"])
+
+    def test_a_remote_renderer_makes_generation_possible_without_a_local_gpu(self):
+        film_api.clear_generation_sources()
+        self.addCleanup(film_api.clear_generation_sources)
+        if film_api.engine_status()["gpu"]:
+            self.skipTest("this machine has a CUDA GPU, so the remote-only path is untestable here")
+        # A peer that answered a recent probe. Nothing is claimed on behalf of a
+        # peer that never answered, which is why the source is what flips this.
+        film_api.register_generation_source(
+            lambda: [
+                {
+                    "kind": "remote_maestro",
+                    "peer_id": "desk-1",
+                    "label": "PC with RTX",
+                    "online": True,
+                }
+            ]
+        )
+        status = film_api.engine_status()
+        self.assertTrue(status["remote_generation_available"])
+        self.assertTrue(status["generation_possible"])
+        self.assertFalse(status["generation_possible_here"])
+        self.assertEqual(status["generation_runs_on"], "PC with RTX")
+
+    def test_a_source_that_is_offline_is_not_a_renderer(self):
+        film_api.clear_generation_sources()
+        self.addCleanup(film_api.clear_generation_sources)
+        film_api.register_generation_source(
+            lambda: [{"kind": "remote_maestro", "peer_id": "desk-1", "online": False}]
+        )
+        status = film_api.engine_status()
+        self.assertFalse(status["remote_generation_available"])
+        self.assertEqual(status["generation_possible"], status["generation_possible_here"])
 
     def test_edit_progress_is_reported_fractionally(self):
         self.assertEqual(

@@ -64,9 +64,15 @@ generation must run on a machine with an NVIDIA GPU»).
 | Inpaint (SAM 3.1) | No: entorno conda con CUDA |
 | Generación local (vídeo/imagen/audio con H3, LTX, Wan, Flux…) | **No** |
 | Generación en un **nodo remoto con GPU** (peers H3) | Sí — ver [STUDIO-NODES.md](STUDIO-NODES.md) |
+| Generación en **cómputo público gratis por internet** | Sí, automático — ver [PUBLIC-COMPUTE.md](PUBLIC-COMPUTE.md) |
 
-Es decir: el equipo modesto **dirige**, y la generación ocurre donde hay GPU. Ése es el
-diseño de la Fase 2 (proveedor remoto + cola + nodos con token), no un apaño.
+Es decir: el equipo modesto **dirige**, y la generación ocurre donde hay GPU — en un
+equipo tuyo con tarjeta, o en una **máquina pública gratuita que Maestro conecta solo**
+si no hay ninguna otra. Este último caso no necesita que configures nada: busca Spaces
+públicos en ejecución, los sondea y usa el que puede hacer la tarea; el resultado se
+descarga en la carpeta del trabajo igual que cualquier otro render. Ojo a la diferencia:
+un equipo con tarjeta ejecuta *tu* receta, la máquina pública ejecuta *su* modelo, así que
+ahí el vídeo se parece a lo que pediste pero no es idéntico.
 
 ## Requisitos y expectativas reales
 
@@ -88,8 +94,11 @@ diseño de la Fase 2 (proveedor remoto + cola + nodos con token), no un apaño.
    continuará: `app/env-light` (Python 3.10 + PyTorch CPU), dependencias de
    `app/requirements.txt`, kernel GGUF (no-op sin CUDA), componente seed-vc y build de la UI.
 3. Al terminar, **Start**. El menú mostrará «Start — CPU / light runtime».
-4. Abre la **Web UI**. Si vas a generar en otro equipo con GPU, registra ese nodo
-   ([STUDIO-NODES.md](STUDIO-NODES.md)) y usa la cola desde el panel de Studio.
+4. Abre la **Web UI**. Ya puedes generar: si tienes otro equipo con tarjeta, regístralo
+   ([STUDIO-NODES.md](STUDIO-NODES.md)) para que ejecute tu receta exacta; si no, Maestro
+   conecta por su cuenta una máquina pública gratuita ([PUBLIC-COMPUTE.md](PUBLIC-COMPUTE.md))
+   y la usa. En **Studio → Compute & transfer → Public compute (internet)** ves a cuál se
+   ha conectado.
 
 ## Diagnóstico
 

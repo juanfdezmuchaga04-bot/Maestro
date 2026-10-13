@@ -47,7 +47,9 @@ torch and no ComfyUI.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import mimetypes
 import os
 import re
 import tempfile
@@ -59,6 +61,7 @@ from urllib.parse import quote
 
 from . import comfyui_adapter
 from . import generation_queue as queue
+from . import upload_chunks
 from .engine_providers import CAPABILITIES, CAPABILITY_SPECS
 from .queue_worker import JobCancelled
 
@@ -68,27 +71,35 @@ __all__ = [
     "DEFAULT_POLL_TIMEOUT",
     "DEFAULT_TIMEOUT",
     "ENGINE_PREFIX",
+    "MEDIA_PARAM_KEYS",
     "PEERS_FILENAME",
     "PEER_ONLINE_TTL",
+    "PEER_REFRESH_AFTER",
+    "TRANSFER_CHUNK_SIZE",
+    "TRANSFER_TIMEOUT",
     "RemoteAuthError",
     "RemoteEngineError",
     "RemoteMaestroClient",
     "add_peer",
     "describe_peer",
     "engines_for_peers",
+    "ensure_peer_worker",
     "generation_sources",
     "get_peer",
     "list_peers",
+    "local_media_params",
     "peer_credentials",
     "peer_id_from_engine",
     "peer_id_from_job",
     "probe_peer",
     "provider_entries",
+    "refresh_stale_peers",
     "remember_probe",
     "remote_payload",
     "register_remote_handlers",
     "remove_peer",
     "run_job",
+    "transfer_media",
     "unregister_remote_handlers",
     "update_peer",
     "validate_base_url",
@@ -111,6 +122,33 @@ DEFAULT_POLL_INTERVAL = 3.0
 # registry only advertises what was measured recently; a stale probe is not
 # evidence, and an explicit probe (or a finished job) refreshes it.
 PEER_ONLINE_TTL = 3600.0
+
+# A shorter window than the registry's: past this age a configured peer is asked
+# again before it is treated as unreachable, so a computer that was switched off
+# and on again is usable without anyone pressing Probe (see refresh_stale_peers).
+PEER_REFRESH_AFTER = 120.0
+
+# Media a delegating computer has to send along with a request: 8 MB chunks match
+# the upload session default, and a transfer of one chunk over a LAN is measured
+# in seconds, so it gets its own, longer timeout than a JSON call.
+TRANSFER_CHUNK_SIZE = upload_chunks.DEFAULT_CHUNK_SIZE
+TRANSFER_TIMEOUT = 300.0
+
+# Request parameters that name a file on the machine that submitted the job.  The
+# list mirrors ``services.engine_routing.LOCAL_MEDIA_PARAMS`` — that module decides
+# *whether* a request can be delegated, this one *how* its files get there.
+MEDIA_PARAM_KEYS = (
+    "image_start",
+    "image_end",
+    "image_refs",
+    "image_guide",
+    "image_mask",
+    "video_guide",
+    "video_guide2",
+    "audio_guide",
+    "audio_guide2",
+    "viggle_character",
+)
 
 MAX_JSON_BYTES = 4 * 1024 * 1024
 DOWNLOAD_CHUNK = 1024 * 1024
@@ -559,23 +597,15 @@ class RemoteMaestroClient:
         reason = getattr(error, "reason", error)
         raise RemoteEngineError(f"Cannot reach Maestro at {self.base_url}: {reason}") from error
 
-    def call(
+    def send(
         self,
-        path: str,
+        request: urlrequest.Request,
         *,
-        method: str = "GET",
-        payload: Optional[Mapping[str, Any]] = None,
+        timeout: Optional[float] = None,
     ) -> tuple[int, Any]:
-        """One JSON request.  Returns ``(status, body)``; transport errors raise."""
-        data = json.dumps(dict(payload)).encode("utf-8") if payload is not None else None
-        request = urlrequest.Request(
-            f"{self.base_url}{path}",
-            data=data,
-            headers=self._headers(payload),
-            method=method,
-        )
+        """Send one prepared request and read a bounded JSON answer."""
         try:
-            with urlrequest.urlopen(request, timeout=self.timeout) as response:
+            with urlrequest.urlopen(request, timeout=float(timeout or self.timeout)) as response:
                 status = int(getattr(response, "status", 200) or 200)
                 raw = response.read(MAX_JSON_BYTES + 1)
         except urlerror.HTTPError as exc:
@@ -597,9 +627,43 @@ class RemoteMaestroClient:
 
         if len(raw) > MAX_JSON_BYTES:
             raise RemoteEngineError(
-                f"{self.base_url}{path} answered with more JSON than this client will read"
+                f"{request.full_url} answered with more JSON than this client will read"
             )
         return status, _json_of(raw)
+
+    def call(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        payload: Optional[Mapping[str, Any]] = None,
+        timeout: Optional[float] = None,
+    ) -> tuple[int, Any]:
+        """One JSON request.  Returns ``(status, body)``; transport errors raise."""
+        data = json.dumps(dict(payload)).encode("utf-8") if payload is not None else None
+        request = urlrequest.Request(
+            f"{self.base_url}{path}",
+            data=data,
+            headers=self._headers(payload),
+            method=method,
+        )
+        return self.send(request, timeout=timeout)
+
+    def post_bytes(
+        self,
+        path: str,
+        data: bytes,
+        *,
+        timeout: Optional[float] = None,
+    ) -> tuple[int, Any]:
+        """Send an opaque body (one upload chunk) rather than JSON."""
+        headers = {"Accept": "application/json", "Content-Type": "application/octet-stream"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        request = urlrequest.Request(
+            f"{self.base_url}{path}", data=data, headers=headers, method="POST"
+        )
+        return self.send(request, timeout=timeout)
 
     # -- the peer's own report -------------------------------------------
 
@@ -634,6 +698,104 @@ class RemoteMaestroClient:
             "queue_handlers": _string_list(queue_state.get("handlers")) if queue_status == 200 else [],
             "authenticated": bool(self.token),
         }
+
+    def start_worker(self, *, worker: str = "local", interval: float = 2.0) -> dict[str, Any]:
+        """Ask the peer to run its own queue worker.
+
+        A delegated job is *stored* on the peer, and only the peer's worker turns a
+        stored job into a render.  Starting it is the peer's own documented action
+        (``POST /api/v1/production/queue/worker/start``), so a computer that was just
+        booted can render the work sent to it without anyone sitting at it.
+        """
+        status, body = self.call(
+            "/api/v1/production/queue/worker/start",
+            method="POST",
+            payload={"worker": str(worker or "local"), "interval": float(interval)},
+        )
+        if status != 200 or not isinstance(body, Mapping):
+            raise RemoteEngineError(
+                f"{self.base_url} could not start its queue worker (HTTP {status}): "
+                f"{_detail(body) or 'no detail'}"
+            )
+        return dict(body)
+
+    # -- sending this machine's own media ---------------------------------
+
+    def upload_file(
+        self,
+        path: str,
+        *,
+        chunk_size: int = TRANSFER_CHUNK_SIZE,
+        timeout: float = TRANSFER_TIMEOUT,
+    ) -> str:
+        """Send one file to the peer and return the path it now has **there**.
+
+        Uses the peer's own resumable upload sessions, so nothing large is ever held
+        in memory here and the peer assembles the file itself (deduplicating
+        identical content by SHA-256).  Returns the peer-side absolute path — a path
+        from this machine would mean nothing on the other one.
+        """
+        absolute = os.path.abspath(str(path or ""))
+        if not os.path.isfile(absolute):
+            raise RemoteEngineError(f"{path} is not a file on this computer")
+        size = os.path.getsize(absolute)
+        if size <= 0:
+            raise RemoteEngineError(f"{absolute} is empty, so there is nothing to send")
+        step = max(64 * 1024, min(int(chunk_size or TRANSFER_CHUNK_SIZE), 256 * 1024 * 1024))
+        content_type = mimetypes.guess_type(absolute)[0] or "application/octet-stream"
+        status, body = self.call(
+            "/api/v1/uploads/sessions",
+            method="POST",
+            payload={
+                "filename": os.path.basename(absolute),
+                "total_bytes": size,
+                "content_type": content_type,
+                "sha256": _file_sha256(absolute),
+                "chunk_size": step,
+            },
+            timeout=timeout,
+        )
+        session = body if isinstance(body, Mapping) else {}
+        session_id = str(session.get("session_id") or "")
+        if status not in {200, 201} or not session_id:
+            raise RemoteEngineError(
+                f"{self.base_url} refused the upload of {os.path.basename(absolute)} "
+                f"(HTTP {status}): {_detail(body) or 'no detail'}"
+            )
+        step = int(session.get("chunk_size") or step)
+        with open(absolute, "rb") as handle:
+            index = 0
+            while True:
+                block = handle.read(step)
+                if not block:
+                    break
+                chunk_status, chunk_body = self.post_bytes(
+                    f"/api/v1/uploads/sessions/{session_id}/chunks"
+                    f"?index={index}&sha256={hashlib.sha256(block).hexdigest()}",
+                    block,
+                    timeout=timeout,
+                )
+                if chunk_status not in {200, 201}:
+                    raise RemoteEngineError(
+                        f"{self.base_url} refused chunk {index} of "
+                        f"{os.path.basename(absolute)} (HTTP {chunk_status}): "
+                        f"{_detail(chunk_body) or 'no detail'}"
+                    )
+                index += 1
+        status, body = self.call(
+            f"/api/v1/uploads/sessions/{session_id}/complete",
+            method="POST",
+            payload={"dedup": True},
+            timeout=timeout,
+        )
+        assembled = body if isinstance(body, Mapping) else {}
+        final_path = str(assembled.get("final_path") or "")
+        if status != 200 or not final_path:
+            raise RemoteEngineError(
+                f"{self.base_url} could not assemble {os.path.basename(absolute)} "
+                f"(HTTP {status}): {_detail(body) or 'no detail'}"
+            )
+        return final_path
 
     # -- the peer's queue -------------------------------------------------
 
@@ -855,6 +1017,107 @@ def probe_peer(
     }
 
 
+def ensure_peer_worker(
+    root: str,
+    peer_id: str,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    now: Optional[float] = None,
+) -> dict[str, Any]:
+    """Make sure the peer's own queue worker is running; report what it says.
+
+    A delegated job is *stored* on the peer and only that computer's worker turns a
+    stored job into a render — so a peer that was just switched on would accept the
+    work and sit on it.  Asking it to start is the peer's own documented action
+    (``POST /api/v1/production/queue/worker/start``) and it is idempotent, which is
+    what makes it safe to do whenever work is handed over: nobody has to sit at the
+    computer that has the GPU.
+
+    Never raises for a peer that is off or refusing: the answer says so, and the
+    caller decides (a job stays queued for that computer, exactly as it does for a
+    peer that was configured and is switched off).
+    """
+    stamp = _now(now)
+    result: dict[str, Any] = {
+        "peer_id": peer_id,
+        "online": False,
+        "started": False,
+        "reason": "",
+        "handlers": [],
+    }
+    try:
+        record = get_peer(root, peer_id)
+        client = RemoteMaestroClient(
+            str(record.get("base_url") or ""),
+            token=str(record.get("token") or ""),
+            timeout=timeout,
+        )
+        described = client.describe()
+        handlers = _string_list(described.get("queue_handlers"))
+        result["online"] = True
+        result["handlers"] = handlers
+        if described.get("queue_worker_running"):
+            result["reason"] = "Its queue worker was already running."
+            return result
+        client.start_worker()
+        after = client.describe()
+        result["started"] = bool(after.get("queue_worker_running"))
+        result["handlers"] = _string_list(after.get("queue_handlers")) or handlers
+        result["reason"] = (
+            "Its queue worker is running now, so it can render what this computer sends."
+            if result["started"]
+            else "Its queue worker was asked to start but does not report running yet."
+        )
+        remember_probe(root, peer_id, {"at": stamp, **after}, now=stamp)
+    except (RemoteEngineError, FileNotFoundError) as error:
+        result["reason"] = (
+            f"{error}. Work sent to it stays queued there until it answers."[:400]
+        )
+    return result
+
+
+def refresh_stale_peers(
+    root: str,
+    *,
+    max_age: float = PEER_REFRESH_AFTER,
+    timeout: float = DEFAULT_TIMEOUT,
+    now: Optional[float] = None,
+) -> dict[str, bool]:
+    """Ask every configured peer whose last answer is older than ``max_age``.
+
+    This is what makes delegation need no gesture from the user: the machine that
+    cannot generate asks the machines that can, on its own, whenever the answer it
+    remembers has gone stale (or was never given).  ``max_age=0`` probes every
+    configured peer, which is what a startup refresh does.
+
+    A peer that does not answer is recorded as unreachable — not deleted, not
+    retried here: the caller's job simply stays queued for it, exactly as it does
+    for a peer that was configured and is switched off.  Returns ``{peer_id: online}``.
+    """
+    stamp = _now(now)
+    results: dict[str, bool] = {}
+    for peer in list_peers(root, now=stamp):
+        peer_id = str(peer.get("peer_id") or "")
+        if not peer_id:
+            continue
+        probe = peer.get("last_probe") or {}
+        answered_at = probe.get("at")
+        try:
+            seen = float(answered_at)
+        except (TypeError, ValueError):
+            seen = 0.0
+        if _is_online(probe, stamp) and (stamp - seen) <= float(max_age):
+            results[peer_id] = True
+            continue
+        try:
+            outcome = probe_peer(root, peer_id, timeout=timeout, now=stamp)
+        except (RemoteEngineError, FileNotFoundError, OSError):
+            results[peer_id] = False
+            continue
+        results[peer_id] = bool(outcome.get("online"))
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Running a delegated job
 # ---------------------------------------------------------------------------
@@ -866,14 +1129,124 @@ def _destination_name(job_id: str, name: Any) -> str:
     return f"{str(job_id)[:12]}_{base}"
 
 
-def remote_payload(job: Mapping[str, Any], peer: Mapping[str, Any], dedupe_key: str) -> dict[str, Any]:
+def _file_sha256(path: str, *, block: int = 1024 * 1024) -> str:
+    """The digest the peer checks the assembled file against."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(block)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _media_entries(value: Any) -> list[str]:
+    """The path-shaped strings a media parameter carries, in order."""
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [str(item).strip() for item in value if str(item or "").strip()]
+    return []
+
+
+def local_media_params(params: Mapping[str, Any]) -> dict[str, list[str]]:
+    """The request parameters that name a file on *this* computer, by key.
+
+    Only what the request states is read: nothing is inferred from a model or a
+    mode name.  An unrecognised shape (a parameter that is neither a path nor a
+    list of paths) is reported as unnamed-and-unsendable by :func:`transfer_media`
+    rather than guessed at.
+    """
+    found: dict[str, list[str]] = {}
+    for key in MEDIA_PARAM_KEYS:
+        value = params.get(key)
+        if value is None:
+            continue
+        entries = _media_entries(value)
+        if entries:
+            found[key] = entries
+        elif isinstance(value, (list, tuple, set, frozenset, Mapping)) and len(value):
+            # Not paths, but not empty either: reported as unsendable, not guessed at.
+            found[key] = []
+    return found
+
+
+def _resolve_local_media(entry: str) -> tuple[str, str]:
+    """Split one parameter entry into ``(local_path, suffix)``.
+
+    ``suffix`` is what follows the path in the entry (the engine's own
+    ``path:frame`` form is kept intact on the peer side).  Raises
+    :class:`RemoteEngineError` when the entry names no file here.
+    """
+    candidate = os.path.abspath(entry)
+    if os.path.isfile(candidate):
+        return candidate, ""
+    head, separator, tail = entry.rpartition(":")
+    if separator and head:
+        option = os.path.abspath(head)
+        if os.path.isfile(option):
+            return option, f":{tail}"
+    raise RemoteEngineError(f"{entry} is not a file on this computer")
+
+
+def transfer_media(
+    client: "RemoteMaestroClient",
+    params: Mapping[str, Any],
+    *,
+    note: Optional[Callable[[str], None]] = None,
+    chunk_size: int = TRANSFER_CHUNK_SIZE,
+    timeout: float = TRANSFER_TIMEOUT,
+) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+    """Send the request's own media to the peer and rewrite the parameters.
+
+    Returns ``(params_for_the_peer, unsent)``: the parameters with every media
+    path pointing at the copy the peer now owns, and the ``(key, entry)`` pairs
+    that could not be sent.  A non-empty ``unsent`` means the caller must **not**
+    submit the job — a render silently missing a reference frame is worse than a
+    refusal that names the file.
+    """
+    rewritten = dict(params)
+    unsent: list[tuple[str, str]] = []
+    for key, entries in local_media_params(params).items():
+        if not entries:
+            unsent.append((key, "it is not a path or a list of paths"))
+            continue
+        sent: list[str] = []
+        failed = False
+        for entry in entries:
+            try:
+                local_path, suffix = _resolve_local_media(entry)
+                remote_path = client.upload_file(
+                    local_path, chunk_size=chunk_size, timeout=timeout
+                )
+            except RemoteEngineError as error:
+                unsent.append((key, str(error)[:200]))
+                failed = True
+                continue
+            sent.append(f"{remote_path}{suffix}")
+            if callable(note):
+                note(
+                    f"Sent {os.path.basename(local_path)} to the remote computer for "
+                    f"{key}, so it can render this request."
+                )
+        if failed or not sent:
+            continue
+        original = params.get(key)
+        rewritten[key] = sent[0] if isinstance(original, str) else sent
+    return rewritten, unsent
+
+
+def remote_payload(job: Mapping[str, Any], peer: Mapping[str, Any], dedupe_key: str,
+                   *, params: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
     """The job as the peer should receive it.
 
     Local-only keys are stripped: a ``base_url`` or a peer id from this machine
     means nothing on the other one.  ``cancel_supported`` is declared because the
     remote engine has to be able to stop the render when this side asks.
     """
-    params = dict(job.get("params") or {})
+    params = dict(params if params is not None else (job.get("params") or {}))
     for local_key in ("base_url", "peer_id"):
         params.pop(local_key, None)
     remote_engine = str(params.pop("remote_engine", "") or peer.get("engine") or DEFAULT_PEER_ENGINE)
@@ -1016,7 +1389,7 @@ def run_job(
     context: Any,
     *,
     peers_root: str,
-    out_dir: str,
+    out_dir: Any,
     poll_timeout: float = DEFAULT_POLL_TIMEOUT,
     poll_interval: float = DEFAULT_POLL_INTERVAL,
     timeout: float = DEFAULT_TIMEOUT,
@@ -1082,8 +1455,25 @@ def run_job(
             note=f"Reusing the job {remote_id} this delegation already created on {peer_id}.",
         )
     else:
+        # The request's own media has to reach the peer before the job does: a path
+        # on this computer means nothing there.  Files that cannot be sent stop the
+        # hand-over with the reason, instead of rendering without them.
+        params, unsent = transfer_media(
+            client,
+            params,
+            note=lambda text: _safe_report(context, note=text),
+        )
+        if unsent:
+            context.fail(
+                "This request names media that could not be sent to the remote computer: "
+                + "; ".join(f"{key} — {reason}" for key, reason in unsent)
+                + ". It was not rendered there, because a reference that is missing on "
+                "that computer would produce a different video.",
+                retryable=False,
+            )
+            return []
         try:
-            submitted = client.submit_job(remote_payload(job, peer, dedupe_key))
+            submitted = client.submit_job(remote_payload(job, peer, dedupe_key, params=params))
         except RemoteAuthError as error:
             context.fail(str(error), retryable=False)
             return []
@@ -1172,8 +1562,12 @@ def run_job(
         )
 
     files: list[str] = []
+    # ``out_dir`` is a string for a single fixed destination, or a callable of the
+    # job when the caller has to follow the job's own workspace (a Films shot can
+    # belong to a workspace that is not the active one).
+    destination_dir = str(out_dir(job)) if callable(out_dir) else str(out_dir)
     for entry in present:
-        destination = os.path.join(out_dir, _destination_name(job_id, entry.get("name")))
+        destination = os.path.join(destination_dir, _destination_name(job_id, entry.get("name")))
         try:
             result = client.download(
                 remote_id,
@@ -1215,7 +1609,8 @@ def register_remote_handlers(
     """Route ``node:<peer_id>`` jobs to the peer's own queue.
 
     ``replace`` defaults to True because Maestro re-registers at startup for
-    whichever peers are configured then.
+    whichever peers are configured then.  ``out_dir`` is where the results are
+    downloaded: a directory, or a callable that receives the job and returns one.
     """
     from . import queue_worker
 

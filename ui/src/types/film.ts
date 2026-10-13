@@ -347,6 +347,18 @@ export interface FilmProductionRequest {
   skip_reason: string
 }
 
+export interface FilmRemoteSource {
+  kind: string
+  peer_id: string
+  label: string
+  base_url: string
+  engine_id: string
+  capabilities: string[]
+  models: string[]
+  online: boolean
+  last_probe_at: number | null
+}
+
 export interface FilmEngineStatus {
   gpu: boolean
   ffmpeg: boolean
@@ -354,7 +366,14 @@ export interface FilmEngineStatus {
   audio_analysis: boolean
   image_analysis: boolean
   pdf_text: boolean
+  /** Can a render be submitted from here and actually run — here or on a peer. */
   generation_possible: boolean
+  /** Narrower: this computer itself has a usable CUDA GPU. */
+  generation_possible_here: boolean
+  /** Who will render: "this computer", or the label of the peer that will. */
+  generation_runs_on: string
+  remote_generation_available: boolean
+  remote_sources: FilmRemoteSource[]
   detail: string
 }
 

@@ -471,8 +471,10 @@ export function StudioStoryboardPanel() {
             disabled={Boolean(busy) || pending === 0 || !engine?.generation_possible}
             title={
               engine?.generation_possible
-                ? 'Submit every shot that has no render yet, using the Studio’s current model settings'
-                : 'Generation needs a machine with an NVIDIA GPU'
+                ? engine.generation_possible_here
+                  ? 'Submit every shot that has no render yet, using the Studio’s current model settings'
+                  : `Submit every shot that has no render yet. This computer cannot generate, so the shots are sent to ${engine.generation_runs_on || 'a peer with a GPU'} and the results come back into this workspace.`
+                : 'Generation needs a machine with an NVIDIA GPU: install the engine here or add a peer in Compute & transfer'
             }
             className="inline-flex items-center gap-1.5 rounded-lg bg-accent-blue px-3 py-1.5 text-[11px] font-medium text-white disabled:opacity-40"
           >

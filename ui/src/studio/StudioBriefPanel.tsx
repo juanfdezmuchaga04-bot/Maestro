@@ -304,6 +304,14 @@ export function StudioBriefPanel() {
             run the production on a machine with an NVIDIA GPU.
           </p>
         )}
+
+        {engine && !engine.generation_possible_here && engine.remote_generation_available && (
+          <p className="text-[11px] text-text-muted">
+            This computer cannot generate on its own, so the production runs on{' '}
+            <span className="text-text-secondary">{engine.generation_runs_on}</span> and each result
+            is transferred back into this workspace.
+          </p>
+        )}
       </section>
 
       <section className="space-y-3">

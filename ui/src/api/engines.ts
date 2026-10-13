@@ -8,6 +8,11 @@ import type {
   ComfyProbeResult,
   ComfyTemplateDetail,
   EnginesStatus,
+  PublicConnectResult,
+  PublicProviderInfo,
+  PublicProvidersResponse,
+  RemotePeerInfo,
+  RemotePeersResponse,
   UploadLimits,
   UploadSessionState,
   UploadedReference,
@@ -145,6 +150,106 @@ export function recoverComputeNode(
 
 export function fetchComputeAssignments(): Promise<ComputeAssignments> {
   return request('/api/v1/compute/assignments')
+}
+
+// --- Remote peers (another Maestro with a GPU) -----------------------------
+// A peer is reached on its own production queue with a bearer token, so its
+// capabilities are declared here or measured from its own report — never guessed.
+// Jobs keep running on this machine's durable queue while that computer is off.
+
+export function fetchRemotePeers(): Promise<RemotePeersResponse> {
+  return request('/api/v1/engines/remote/peers')
+}
+
+export function addRemotePeer(params: {
+  peerId: string
+  label?: string
+  baseUrl: string
+  token?: string
+  engine?: string
+  capabilities?: string[]
+  notes?: string
+}): Promise<{
+  peer: RemotePeerInfo
+  probe: Record<string, unknown> | null
+  online: boolean
+  engines: string[]
+  registered: string[]
+  next_step: string
+}> {
+  return request('/api/v1/engines/remote/peers', {
+    method: 'POST',
+    body: JSON.stringify({
+      peer_id: params.peerId,
+      label: params.label,
+      base_url: params.baseUrl,
+      token: params.token,
+      engine: params.engine,
+      capabilities: params.capabilities,
+      notes: params.notes,
+    }),
+  })
+}
+
+export function probeRemotePeer(
+  peerId: string,
+  timeout?: number,
+): Promise<{ peer_id: string; online: boolean; probe: Record<string, unknown>; peer: RemotePeerInfo }> {
+  return request(`/api/v1/engines/remote/peers/${peerId}/probe`, {
+    method: 'POST',
+    body: JSON.stringify({ timeout }),
+  })
+}
+
+export function removeRemotePeer(peerId: string): Promise<{ removed: string; note: string }> {
+  return request(`/api/v1/engines/remote/peers/${peerId}`, { method: 'DELETE' })
+}
+
+// --- Public compute (a free engine on the internet) ------------------------
+// Nothing here needs configuring: Maestro finds a running public Space on its own
+// and keeps the connection honest on a timer. These calls are how the panel shows
+// what it connected to, and how someone points it at one Space by hand.
+
+export function fetchPublicProviders(): Promise<PublicProvidersResponse> {
+  return request('/api/v1/engines/public/providers')
+}
+
+/** Look for free public engines now, instead of waiting for the next check. */
+export function connectPublicCloud(
+  options: { capabilities?: string[]; candidates?: number } = {},
+): Promise<PublicConnectResult> {
+  return request('/api/v1/engines/public/connect', {
+    method: 'POST',
+    body: JSON.stringify({
+      capabilities: options.capabilities,
+      candidates: options.candidates,
+    }),
+  })
+}
+
+export function probePublicProvider(
+  providerId: string,
+): Promise<{ provider: PublicProviderInfo; probe: Record<string, unknown> }> {
+  return request(`/api/v1/engines/public/providers/${encodeURIComponent(providerId)}/probe`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  })
+}
+
+export function addPublicSpace(params: {
+  space: string
+  capability: string
+}): Promise<{ provider: PublicProviderInfo; probe: Record<string, unknown> }> {
+  return request('/api/v1/engines/public/spaces', {
+    method: 'POST',
+    body: JSON.stringify({ space: params.space, capability: params.capability }),
+  })
+}
+
+export function forgetPublicProvider(providerId: string): Promise<{ removed: string; note: string }> {
+  return request(`/api/v1/engines/public/providers/${encodeURIComponent(providerId)}`, {
+    method: 'DELETE',
+  })
 }
 
 // --- Reference URLs --------------------------------------------------------

@@ -365,7 +365,15 @@ function ClapperMark() {
 
 function EngineBadge({ engine }: { engine: FilmEngineStatus | null }) {
   if (!engine) return null
+  const local = engine.generation_possible_here
+  const remote = engine.remote_generation_available
   const ready = engine.generation_possible
+  const runtime = engine.generation_runs_on || 'this computer'
+  const title = local
+    ? 'Local GPU detected: generation, assembly and export can run here.'
+    : remote
+      ? `No CUDA GPU in this process, so generation is delegated to ${runtime}: every render is queued on that computer's own engine and the finished file is transferred back into this workspace. This computer only plans, assembles and edits.`
+      : 'No CUDA GPU detected in this process and no remote computer is configured to render. Planning, media and assembly are available; add a peer with a GPU in Compute & transfer to generate.'
   return (
     <span
       className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[11px] ${
@@ -373,14 +381,10 @@ function EngineBadge({ engine }: { engine: FilmEngineStatus | null }) {
           ? 'border-accent-green/40 bg-accent-green/10 text-text-primary'
           : 'border-indicator-warning/40 bg-indicator-warning/10 text-text-primary'
       }`}
-      title={
-        ready
-          ? 'Local GPU detected: generation, assembly and export can run here.'
-          : 'No CUDA GPU detected in this process. Planning, media and assembly are available; generation must run on a machine with an NVIDIA GPU.'
-      }
+      title={title}
     >
       <Cpu size={12} />
-      {ready ? 'GPU ready' : 'GPU unavailable'}
+      {local ? 'GPU ready' : remote ? `Remote GPU · ${runtime}` : 'GPU unavailable'}
       {!engine.ffmpeg && <span className="text-indicator-warning">· no FFmpeg</span>}
     </span>
   )

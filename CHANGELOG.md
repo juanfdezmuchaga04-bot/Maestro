@@ -5,9 +5,62 @@ pipeline's own history lives in [app/docs/CHANGELOG.md](app/docs/CHANGELOG.md).
 
 ## [Unreleased]
 
-Production readiness for driving Maestro from a phone, and an integrity fix for
-cached model receipts.
+Production readiness for driving Maestro from a phone, free public compute for
+machines with no GPU, and an integrity fix for cached model receipts.
 
+- **A computer with no GPU and no second machine now renders on free public
+  compute, connected by itself.** `app/services/public_cloud.py` asks the public
+  Hugging Face Hub which of its Gradio Spaces are *running right now* on free
+  ZeroGPU hardware for the capability a request needs, reads the Space's own
+  `/gradio_api/info` to find the endpoint that really renders (Gradio's event
+  callbacks, prompt builders and settings dumps take a prompt too and are
+  excluded), connects, and remembers the answer — at startup, on a timer, and
+  again before a request would otherwise be refused. Nothing has to be installed,
+  configured or signed into, and no key of the user's is ever sent. It is the
+  third place a render can run and deliberately the last: a public Space runs its
+  own model with its own defaults, so a render there *approximates* the Maestro
+  recipe (the route says so as `public_approximation`) where a peer replays it
+  exactly. The request is mapped onto the Space's declared inputs (prompt, seed,
+  steps, duration derived from frames and frame rate, a start frame uploaded to a
+  declared file input); a value outside the engine's own declared range is brought
+  inside it *and reported*, and a required input nothing can fill stops the render
+  by name. A Space that breaks, refuses, or has spent its free quota is not the
+  end of the attempt: another connected Space is tried, and if none can take it
+  the job *waits* (no attempt consumed) instead of failing. Results are validated
+  against the capability that asked (an image is an image) so a JSON or HTML error
+  body can never be recorded as a finished render. New endpoints:
+  `GET /api/v1/engines/public/providers`, `POST …/public/connect`, `POST
+  …/public/spaces` (use one particular Space by hand), `POST
+  …/public/providers/<id>/probe`, `DELETE …/public/providers/<id>`; the Studio
+  panel grows a **Public compute (internet)** section. See
+  [Free public compute](docs/PUBLIC-COMPUTE.md).
+- **A computer without a CUDA GPU now only directs, with nothing to configure
+  after the peer is saved.** The configured peers are asked again automatically —
+  at startup, every minute while the application runs, and once on the spot before
+  a request would otherwise be refused — so a GPU computer switched on later is
+  usable immediately instead of after someone presses Probe. Handing work over asks
+  that computer to start its own queue worker (its own idempotent
+  `POST /api/v1/production/queue/worker/start`), so nothing has to be started by
+  hand on the machine that renders. The media a request brings from here — a start
+  frame, references, a control video, a soundtrack — is sent to the peer through
+  its own chunked upload sessions (SHA-256 verified, deduplicated by content) and
+  the parameters are rewritten to the copies it owns, so a shot with references
+  renders there exactly as it would here; a file that cannot be sent stops the
+  hand-over and the failure names it instead of rendering without it. The upload
+  session endpoints moved to `app/services/upload_api.py` (a router factory, like
+  the production queue) so the transfer is exercised over HTTP against the real
+  implementation in `tests/test_remote_engine.py`.
+- **Studio and Films delegate generation automatically on a computer without a
+  CUDA GPU.** `app/services/engine_routing.py` decides once, from measured state,
+  where a request runs: a machine whose local engine can generate always runs it
+  there, otherwise the job goes to a configured peer Maestro that *reported* it can
+  render (`node:<peer_id>` in the durable queue), and the result is downloaded into
+  the job's own workspace so the gallery, the Editor and the storyboard see it like
+  any other render. The peer is asked for its own `maestro` engine — the runner that
+  executes a Studio/Films parameter set — and that runner never delegates onward.
+  A request that nothing can run is refused with a 409 naming what is missing
+  instead of becoming a job that fails later. See
+  [Engines, compute nodes and large-file transfer](docs/STUDIO-NODES.md).
 - Add an **optional sign-in gate** (`scripts/maestro_access.py`, service in
   `app/services/access_gate.py`): PBKDF2-stored password or a
   `MAESTRO_ACCESS_TOKEN`, signed HttpOnly session cookies, a sign-in page in

@@ -976,7 +976,13 @@ Initial public release. See [CHANGELOG.md](CHANGELOG.md) for the full feature ru
 
 The first video is always the slow one: install is ~10–20 min, then the first generation on each model downloads its weights (the default video model is ~18 GB). After that, weights are cached and only generation time applies. Maestro's auto-tune sizes the settings to your card on first launch so you don't have to.
 
-> ⚠ **AMD GPUs and Macs cannot generate locally.** The generation pipeline depends on CUDA and several NVIDIA-only kernels; generation on an AMD card or an Apple GPU is out of scope. **Installing and running Maestro itself is supported on such a machine**: Install never stops without an NVIDIA GPU, it sets up the CPU / light runtime (`app/env-light`) instead, and everything except local generation works — UI, Studio, Films, the editor, planning, FFmpeg assembly, the queue and remote H3 engine peers. Generating from such a machine means sending the work to a computer that has a CUDA GPU. See [Installing without an NVIDIA GPU](docs/INSTALAR-SIN-NVIDIA.md) or, on a Mac, [Installing on a Mac](docs/INSTALAR-EN-MAC.md).  
+> ⚠ **AMD GPUs and Macs cannot generate locally.** The generation pipeline depends on CUDA and several NVIDIA-only kernels; generation on an AMD card or an Apple GPU is out of scope. **Installing and running Maestro itself is supported on such a machine**: Install never stops without an NVIDIA GPU, it sets up the CPU / light runtime (`app/env-light`) instead, and everything except local generation works — UI, Studio, Films, the editor, planning, FFmpeg assembly and the queue. Generating from such a machine means sending the work somewhere that has a CUDA GPU, and Studio and Films do that automatically, in this order:
+>
+> 1. **This computer**, if it has the GPU. A local engine always wins.
+> 2. **A computer of yours** — register it in **Studio → Compute & transfer → Remote computers with a GPU**, and a request is queued on *that* computer's own engine, with its real progress shown here and the finished file downloaded into the job's workspace. Saving that computer there is the only setup: this machine asks it again automatically, and when work is handed over it also starts that computer's own queue worker, so nobody has to sit at the GPU machine. The media the request brings from this machine — a start frame, references, a control video, a soundtrack — is sent to it first and the render uses those same files. If that computer is off the job waits instead of failing. See [Engines, compute nodes and large-file transfer](docs/STUDIO-NODES.md).
+> 3. **Free public compute on the internet**, when there is no other computer at all. Maestro asks the public Hugging Face Hub which Spaces are running on free shared GPU hardware right now, reads each Space's own API to find the endpoint that really renders, connects, and re-checks on a timer. Nothing to install, configure or sign into, and no key of yours is sent. A public Space runs its own model with its own defaults, so a render there approximates the Maestro recipe rather than replaying it — which is why it is used last — and free shared GPU time is small (signing Hugging Face in through the launcher's optional action uses that free account's larger allowance). A Space that breaks or has spent its quota defers the job instead of failing it. See [Free public compute](docs/PUBLIC-COMPUTE.md).
+>
+> See also [Installing without an NVIDIA GPU](docs/INSTALAR-SIN-NVIDIA.md) or, on a Mac, [Installing on a Mac](docs/INSTALAR-EN-MAC.md).  
 
 > ⚠ **Model downloads are large.** A typical install pulls **50–100 GB** of model weights on first launch. The full collection can exceed **300 GB**. Make sure you have headroom on the drive where Pinokio is installed. However, only models requested during generation will be downloaded. 
 
@@ -1020,6 +1026,25 @@ After clicking **Start**, the launcher shows an **Open Web UI** button once the 
 - **Main workspace** — generated outputs, Director pipeline status, or the full Editor canvas and timeline
 - **Settings drawer** (gear icon) — model visibility, performance auto-tune, services (LLM, API keys, NSFW, theme)
 - **Pinokio menu** — Update, Reset, Install Inpaint Support, LoRA folder shortcuts
+
+## Free public compute
+
+A computer with no CUDA GPU and no second machine of its own can still render. Maestro connects to a free public engine on the internet by itself — no install, no account, no key, nothing to switch on:
+
+1. It asks the public Hugging Face Hub which Gradio Spaces are **running right now** on free shared GPU hardware (`zero-…`) for the capability the request needs.
+2. It reads each candidate's own `/gradio_api/info` and picks the endpoint that really renders. Gradio's internal event callbacks, prompt builders and settings dumps take a prompt too; they are excluded, because a render sent to one of them would look successful and produce nothing usable.
+3. It connects to the best of what answered, keeps a couple of further Spaces as alternates, and re-measures the connection on a timer. A Space that disappears next month is re-discovered rather than worked around.
+
+The request is mapped onto what the Space declared (prompt, seed, steps, size, a duration derived from frames and frame rate, a start frame uploaded to a file input the Space reports). A value outside that engine's own range is brought inside it *and reported*; a required input nothing can fill stops the render by naming it. Three things are said plainly instead of hidden: a public Space runs **its own model**, so the render *approximates* the Maestro recipe (the route records `public_fidelity: "public_approximation"`); a peer is **always preferred** over public compute, because a peer runs this same pipeline; and a public engine that is broken, out of quota or refusing **defers** the job (it waits, consuming no attempt) rather than failing work you asked for. Results are validated against the capability that asked for them, so a JSON or HTML error body can never be recorded as a finished render.
+
+Free shared GPU time is small. Signing Hugging Face in with the launcher's optional **Connect Hugging Face (Optional)** action uses that free account's larger allowance — no Maestro account, and the token never leaves the computer. The panel is **Studio → Compute & transfer → Public compute (internet)**, where you can also point Maestro at one particular public Space if you prefer. Full detail: [Free public compute](docs/PUBLIC-COMPUTE.md).
+
+API, for automation:
+
+```bash
+curl http://127.0.0.1:7860/api/v1/engines/public/providers
+curl -X POST http://127.0.0.1:7860/api/v1/engines/public/connect
+```
 
 ## Sharing on the local network
 

@@ -12,6 +12,7 @@ Everything described here is implemented in:
 | `app/services/engine_providers.py` | Capabilities and provider registry (the studio never addresses an engine directly) |
 | `app/services/compute_nodes.py` | Node registry: registration, heartbeat, capability routing, parked work |
 | `app/services/remote_engine.py` | Delegating a queued job to another Maestro that has the GPU, and bringing the result back |
+| `app/services/public_cloud.py` | Running a queued job on a free public engine on the internet, connected automatically (see [Free public compute](PUBLIC-COMPUTE.md)) |
 | `app/services/comfyui_adapter.py` | ComfyUI client + versioned workflow templates |
 | `app/services/reference_urls.py` | SSRF-guarded reference URL import |
 | `app/services/upload_chunks.py` | Chunked, resumable uploads for large media |
@@ -27,13 +28,18 @@ registered individually (`CAPABILITIES`):
 `video_extension`, `frame_interpolation`, `upscaling`, `inpainting`,
 `voice_generation`, `audio_generation`, `transcription`, `auxiliary_processing`.
 
-A **provider** declares the subset it can actually do. Providers come in four
+A **provider** declares the subset it can actually do. Providers come in five
 kinds, ordered by preference:
 
 1. `local_engine` — the Maestro engine on this machine
 2. `compute_node` — another computer running Maestro
 3. `comfyui` — a ComfyUI server on its local HTTP API
-4. `commercial_api` — optional, **never required**
+4. `public_cloud` — a free public engine on the internet
+   (`services.public_cloud`), connected by itself, no key and no account. Ranked
+   after everything the user owns or runs on their own network on purpose: a
+   public Space runs its own model, so it approximates the Maestro recipe where a
+   peer replays it exactly.
+5. `commercial_api` — optional, **never required**
 
 Rules enforced by the registry:
 
@@ -157,6 +163,42 @@ renders) and to API clients rather than to the control surface:
   app's own authentication. Do not put an unauthenticated generation API on the
   public internet.
 * A phone cannot wake a powered-off computer. Nothing here claims it can.
+
+### Automatic delegation from Studio and Films
+
+The registry above is bookkeeping; a modest computer also needs the *flows* to use
+it without the user choosing an engine.  `app/services/engine_routing.py` makes
+that decision once per request, from measured state, and `app/launch.py` acts on
+it:
+
+| Situation | What happens |
+| --- | --- |
+| This computer has a CUDA GPU | The job runs here.  A local engine always wins. |
+| No CUDA GPU, and a peer reported it can render | The Studio job is kept — the interface keeps polling the same job id — and a durable queue job (`engine: node:<peer_id>`, `params.remote_engine: maestro`) is handed to that peer.  Progress shown here is the peer's own measurement, and the finished files are downloaded into the job's workspace. |
+| No CUDA GPU, and no peer answered | `409` with the reason.  No job is created that could not run. |
+| The request carries media from this computer | The files (`image_start`, `image_end`, `image_refs`, `image_guide`, `image_mask`, `video_guide`, `audio_guide`, `viggle_character`) are **sent to the peer** through its own upload sessions before the job, and the parameters are rewritten to the copies it owns — same bytes, verified by SHA-256, deduplicated by content.  A file that cannot be sent stops the hand-over and the failure names it. |
+| Nobody is sitting at the GPU computer | Handing work over asks that computer to start its own queue worker (`POST /api/v1/production/queue/worker/start`, idempotent), so a machine that was just switched on renders what is sent to it. |
+| The peer's last answer is minutes old | It is asked again — at startup, every minute while the application runs, and once on the spot before a request would otherwise be refused (only when this computer cannot generate). |
+| A peer is switched off | The queue job is deferred — no attempt consumed, no error — and the render runs when it answers again. |
+| The backend restarts | `_resume_delegated_jobs` re-attaches to the queue job the Studio job started. |
+| A delegated job arrives *here* | The `maestro` queue handler runs it with this machine's own pipeline — and refuses to delegate onward, so two peers can never pass one job around in a circle. |
+
+A delegation engine the peer must have registered is `maestro`
+(`engine_routing.REMOTE_ENGINE`), which the application registers at startup for
+exactly this; a peer also keeps `comfyui` in `engine` for jobs that name ComfyUI
+directly.  Honest limits, stated rather than discovered later:
+
+* **A transferred file is re-sent per attempt.**  The peer deduplicates content,
+  so a retry does not create a second copy, but the bytes travel again: a job that
+  defers for an hour and is handed over again re-uploads what it brought.
+* **Delegation needs a runner on both sides.**  The peer must be a Maestro that
+  registers the `maestro` engine handler (this version does, at startup) and must
+  expose its upload session endpoints — a peer older than this change accepts the
+  job and reports "no runner".
+* **The Editor's “Edit clip with Maestro AI” and Director's child jobs still run
+  in this process**, not through the router.
+* **Nothing wakes a powered-off computer.**  A delegated job waits for it, and the
+  interface says so rather than failing.
 
 ### Adding more computers later
 

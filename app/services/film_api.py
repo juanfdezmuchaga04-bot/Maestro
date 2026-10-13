@@ -861,13 +861,16 @@ def record_export(
 def engine_status() -> dict[str, Any]:
     """Honest report of what can generate, here or on a registered remote engine.
 
-    ``generation_possible`` keeps its meaning for the workspace screens — *can a
-    render be submitted and run from here by the current flow* — so it stays tied
-    to this machine until the production screens are wired to delegate work.
-    ``remote_sources`` names the computers that answered recently and can render,
-    and ``remote_generation_available`` says whether any exists, so the UI and the
-    API can report the truth about a laptop: no GPU here, but a machine that has
-    one is configured.
+    ``generation_possible`` answers the question the production screens ask — *can
+    a render be submitted from this computer and actually run* — and it is true
+    when either this machine has a CUDA GPU or a peer Maestro that answered a
+    recent probe can render.  The Studio and Films flows delegate to that peer
+    automatically (``services.engine_routing``), so a computer without a GPU is
+    no longer a computer that cannot produce; it is one that produces elsewhere.
+    ``generation_possible_here`` keeps the narrower, local-only answer for the
+    screens that are about *this* engine — the local engine panel and the
+    capability registry — and ``generation_runs_on`` names, in words, the
+    computer the work will actually run on.
     """
     tools = film_assets.local_tool_availability()
     gpu = False
@@ -879,6 +882,12 @@ def engine_status() -> dict[str, Any]:
     except Exception as exc:  # pragma: no cover - depends on the install
         error = str(exc)[:200]
     remote = _online_generation_sources()
+    runs_on = "this computer"
+    if not gpu:
+        runs_on = ""
+        if remote:
+            first = remote[0]
+            runs_on = str(first.get("label") or first.get("peer_id") or "a remote computer")
     return {
         "gpu": gpu,
         "ffmpeg": bool(tools.get("ffmpeg")),
@@ -887,8 +896,9 @@ def engine_status() -> dict[str, Any]:
         "image_analysis": bool(tools.get("pillow")),
         "pdf_text": bool(tools.get("pypdf")),
         "detail": error,
-        "generation_possible": bool(gpu),
+        "generation_possible": bool(gpu) or bool(remote),
         "generation_possible_here": bool(gpu),
+        "generation_runs_on": runs_on,
         "remote_generation_available": bool(remote),
         "remote_sources": remote,
     }

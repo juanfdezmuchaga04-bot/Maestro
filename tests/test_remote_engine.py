@@ -40,6 +40,7 @@ from services import generation_queue as queue  # noqa: E402
 from services import production_queue_api  # noqa: E402
 from services import queue_worker  # noqa: E402
 from services import remote_engine  # noqa: E402
+from services import upload_api  # noqa: E402
 
 TOKEN = "peer-token-9000"
 PEER_ID = "desk-1"
@@ -78,6 +79,15 @@ def build_peer_app(
         }
 
     app.include_router(production_queue_api.create_router(root_provider=lambda: queue_root))
+    # The real chunked upload surface, so a delegating computer's media transfer is
+    # exercised against the implementation the peer actually runs — not a stand-in.
+    uploads_root = os.path.join(queue_root, "..", "peer-uploads")
+    app.include_router(
+        upload_api.create_router(
+            sessions_root_provider=lambda: os.path.join(uploads_root, ".sessions"),
+            uploads_root_provider=lambda: uploads_root,
+        )
+    )
     gate = access_gate.AccessGate(
         settings_dir=os.path.join(queue_root, "..", "peer-settings"),
         environ={"MAESTRO_ACCESS_TOKEN": token} if token else {},
@@ -475,6 +485,46 @@ class DelegationTest(unittest.TestCase):
         # No partial file was left behind.
         self.assertFalse([name for name in os.listdir(self.out_dir) if name.endswith(".part")])
 
+    def test_the_result_lands_in_the_workspace_the_job_names(self):
+        """A callable out_dir follows the job, not the active workspace.
+
+        A Films shot can belong to a workspace that is not the one currently
+        open, so the downloaded clip has to arrive in the folder that job's own
+        gallery entry is served from — otherwise the render succeeds and the
+        storyboard still shows nothing to play.
+        """
+        other = os.path.join(self._tmp.name, "workspace-second")
+        os.makedirs(other, exist_ok=True)
+        clip = os.path.join(self._tmp.name, "peer-clip-2.mp4")
+        payload = fake_mp4(64 * 1024)
+        with open(clip, "wb") as handle:
+            handle.write(payload)
+        with LivePeer(queue_root=self.peer_root) as peer:
+            self.configure_peer(base_url=peer.base_url)
+            self.submit(params={"prompt": "a paper boat", "workspace": "second"})
+            finish_remote_job_eventually(self.peer_root, dedupe_key="maestro:job-1", path=clip)
+            registered = remote_engine.register_remote_handlers(
+                peers_root=self.peers_root,
+                out_dir=lambda job: (
+                    other
+                    if str((job.get("params") or {}).get("workspace") or "") == "second"
+                    else self.out_dir
+                ),
+                poll_interval=0.05,
+                poll_timeout=25.0,
+                timeout=5.0,
+            )
+            self.assertEqual(registered, [f"node:{PEER_ID}"])
+            report = queue_worker.run_once(self.root, worker="laptop")
+
+        self.assertEqual(report["outcome"], "completed", report.get("reason"))
+        produced = queue.job(self.root, "job-1")["outputs"][0]
+        self.assertEqual(os.path.dirname(produced), os.path.realpath(other))
+        with open(produced, "rb") as handle:
+            self.assertEqual(handle.read(), payload)
+        # The workspace the job did *not* name stayed untouched.
+        self.assertEqual(os.listdir(self.out_dir), [])
+
     def test_the_peer_reported_progress_is_forwarded_and_nothing_is_invented(self):
         clip = os.path.join(self._tmp.name, "peer-clip.mp4")
         with open(clip, "wb") as handle:
@@ -714,6 +764,256 @@ class JobRoutingTest(unittest.TestCase):
         self.assertNotIn("base_url", payload["params"])
         self.assertNotIn("peer_id", payload["params"])
         self.assertTrue(payload["cancel_supported"])
+
+
+class MediaTransferTest(unittest.TestCase):
+    """The request's own media reaches the peer, and the job names *that* copy.
+
+    A path on this computer means nothing on the other one, so a request that
+    brings a start frame, references or a control video is not rendered without
+    them: the file travels through the peer's own upload sessions and the parameter
+    is rewritten to the copy the peer now owns.  Both halves are checked here for
+    real — the transfer against the peer's actual upload endpoints, and the job the
+    peer ends up with.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.peers_root = os.path.join(self._tmp.name, "peers")
+        self.peer_root = os.path.join(self._tmp.name, "peer-queue")
+        self.root = os.path.join(self._tmp.name, "local-queue")
+        self.out_dir = os.path.join(self._tmp.name, "workspace")
+        os.makedirs(self.out_dir, exist_ok=True)
+        queue_worker.clear_handlers()
+        self.addCleanup(queue_worker.clear_handlers)
+
+    def configure_peer(self, base_url: str, capabilities=("text_to_video", "image_to_video")) -> dict:
+        return remote_engine.add_peer(
+            self.peers_root,
+            {
+                "peer_id": PEER_ID,
+                "label": "Desktop with the GPU",
+                "base_url": base_url,
+                "token": TOKEN,
+                "capabilities": list(capabilities),
+            },
+        )
+
+    def submit(self, params: dict) -> dict:
+        return queue.submit(
+            self.root,
+            {
+                "job_id": "job-1",
+                "task": "video",
+                "engine": f"node:{PEER_ID}",
+                "model": "wan22_ti2v_5b",
+                "params": params,
+                "cancel_supported": True,
+            },
+        )
+
+    def delegate(self) -> dict:
+        remote_engine.register_remote_handlers(
+            peers_root=self.peers_root, out_dir=self.out_dir,
+            poll_interval=0.05, poll_timeout=25.0, timeout=5.0,
+        )
+        return queue_worker.run_once(self.root, worker="laptop")
+
+    def test_the_start_frame_is_sent_and_the_job_names_the_peers_own_copy(self):
+        image = os.path.join(self._tmp.name, "start-frame.png")
+        image_bytes = b"\x89PNG\r\n\x1a\n" + b"frame-bytes" * 9000
+        with open(image, "wb") as handle:
+            handle.write(image_bytes)
+        clip = os.path.join(self._tmp.name, "remote-clip.mp4")
+        with open(clip, "wb") as handle:
+            handle.write(fake_mp4(64 * 1024))
+        with LivePeer(queue_root=self.peer_root) as peer:
+            self.configure_peer(peer.base_url)
+            self.submit({
+                "prompt": "a paper boat",
+                "remote_engine": "maestro",
+                "image_start": image,
+                "image_refs": [image],
+            })
+            finish_remote_job_eventually(self.peer_root, dedupe_key="maestro:job-1", path=clip)
+            report = self.delegate()
+
+        self.assertEqual(report["outcome"], "completed", report.get("reason"))
+        peer_jobs = queue.list_jobs(self.peer_root)
+        self.assertEqual(len(peer_jobs), 1)
+        params = peer_jobs[0]["params"]
+        # The parameter now names a file on the peer's own disk, with the same
+        # content, and it is not where it was on this computer.
+        sent = params["image_start"]
+        self.assertTrue(os.path.isabs(sent))
+        self.assertNotEqual(os.path.realpath(sent), os.path.realpath(image))
+        self.assertTrue(os.path.isfile(sent), sent)
+        with open(sent, "rb") as handle:
+            self.assertEqual(handle.read(), image_bytes)
+        self.assertEqual(params["image_refs"], [sent])
+        # The local job still holds the work it was given, untouched.
+        self.assertEqual(queue.job(self.root, "job-1")["params"]["image_start"], image)
+
+    def test_media_is_sent_once_per_file_even_when_two_keys_name_it(self):
+        image = os.path.join(self._tmp.name, "shared-ref.png")
+        with open(image, "wb") as handle:
+            handle.write(b"\x89PNG\r\n\x1a\n" + b"shared" * 5000)
+        clip = os.path.join(self._tmp.name, "remote-clip-2.mp4")
+        with open(clip, "wb") as handle:
+            handle.write(fake_mp4(32 * 1024))
+        with LivePeer(queue_root=self.peer_root) as peer:
+            self.configure_peer(peer.base_url)
+            self.submit({
+                "prompt": "a paper boat",
+                "image_start": image,
+                "image_refs": [image],
+            })
+            finish_remote_job_eventually(self.peer_root, dedupe_key="maestro:job-1", path=clip)
+            self.assertEqual(self.delegate()["outcome"], "completed")
+        params = queue.list_jobs(self.peer_root)[0]["params"]
+        # Deduplicated by content on the peer, so both keys point at one file there.
+        self.assertEqual(params["image_start"], params["image_refs"][0])
+
+    def test_a_request_whose_media_is_not_here_is_refused_instead_of_rendered(self):
+        with LivePeer(queue_root=self.peer_root) as peer:
+            self.configure_peer(peer.base_url)
+            self.submit({
+                "prompt": "a paper boat",
+                "image_start": os.path.join(self._tmp.name, "not-here.png"),
+            })
+            report = self.delegate()
+
+        self.assertEqual(report["outcome"], "failed", report)
+        # Nothing was sent: the peer has no job, so nothing was rendered with a
+        # missing reference.
+        self.assertEqual(queue.list_jobs(self.peer_root), [])
+        reason = str(queue.job(self.root, "job-1").get("errors") or "")
+        self.assertIn("image_start", reason)
+        self.assertIn("could not be sent", reason)
+
+
+class PeerWorkerStartTest(unittest.TestCase):
+    """A peer that was just switched on renders without anyone touching it."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.peers_root = os.path.join(self._tmp.name, "peers")
+        self.peer_root = os.path.join(self._tmp.name, "peer-queue")
+        # The worker is a process-wide singleton in this test process, so its state
+        # is put back the way it was found.
+        queue_worker.stop_worker()
+        self.addCleanup(queue_worker.stop_worker)
+
+    def add(self, base_url: str) -> dict:
+        return remote_engine.add_peer(
+            self.peers_root,
+            {
+                "peer_id": PEER_ID,
+                "label": "Desktop with the GPU",
+                "base_url": base_url,
+                "token": TOKEN,
+                "capabilities": ["text_to_video"],
+            },
+        )
+
+    def test_a_quiet_peer_is_asked_to_start_its_worker_once(self):
+        with LivePeer(queue_root=self.peer_root) as peer:
+            self.add(peer.base_url)
+            first = remote_engine.ensure_peer_worker(self.peers_root, PEER_ID)
+            self.assertTrue(first["online"])
+            self.assertTrue(first["started"], first)
+            state = self.wait_for_worker(True)
+            self.assertTrue(state["running"])
+            second = remote_engine.ensure_peer_worker(self.peers_root, PEER_ID)
+            self.assertTrue(second["online"])
+            self.assertFalse(second["started"])
+            self.assertIn("already running", second["reason"])
+
+    def wait_for_worker(self, running: bool, timeout: float = 10.0) -> dict:
+        deadline = time.time() + timeout
+        state = queue_worker.worker_status()
+        while time.time() < deadline:
+            state = queue_worker.worker_status()
+            if bool(state["running"]) == running:
+                return state
+            time.sleep(0.02)
+        return state
+
+    def test_a_peer_that_is_off_is_reported_and_never_raises(self):
+        self.add("http://127.0.0.1:1")
+        answer = remote_engine.ensure_peer_worker(self.peers_root, PEER_ID)
+        self.assertFalse(answer["online"])
+        self.assertFalse(answer["started"])
+        self.assertIn("Cannot reach", answer["reason"])
+
+    def test_an_unknown_peer_is_reported_and_never_raises(self):
+        answer = remote_engine.ensure_peer_worker(self.peers_root, "nobody")
+        self.assertFalse(answer["online"])
+        self.assertIn("not configured", answer["reason"])
+
+
+class StalePeerRefreshTest(unittest.TestCase):
+    """A peer that was switched on after this computer is usable immediately."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.peers_root = os.path.join(self._tmp.name, "peers")
+        self.peer_root = os.path.join(self._tmp.name, "peer-queue")
+
+    def add(self, base_url: str) -> dict:
+        return remote_engine.add_peer(
+            self.peers_root,
+            {
+                "peer_id": PEER_ID,
+                "label": "Desktop with the GPU",
+                "base_url": base_url,
+                "token": TOKEN,
+                "capabilities": ["text_to_video"],
+            },
+        )
+
+    def test_a_peer_is_not_a_generation_source_until_it_is_asked(self):
+        with LivePeer(queue_root=self.peer_root) as peer:
+            self.add(peer.base_url)
+            self.assertEqual(remote_engine.list_peers(self.peers_root)[0]["online"], False)
+            answers = remote_engine.refresh_stale_peers(self.peers_root, max_age=0.0)
+            self.assertEqual(answers, {PEER_ID: True})
+            self.assertTrue(remote_engine.list_peers(self.peers_root)[0]["online"])
+            self.assertEqual(len(remote_engine.generation_sources(self.peers_root)), 1)
+            # A fresh answer is not asked for again on the next call.
+            self.assertEqual(remote_engine.refresh_stale_peers(self.peers_root), {PEER_ID: True})
+
+    def test_a_stale_answer_is_asked_again_so_a_switched_off_peer_stops_counting(self):
+        self.add("http://127.0.0.1:1")
+        remote_engine.remember_probe(
+            self.peers_root,
+            PEER_ID,
+            {"at": time.time(), "reachable": True, "capabilities": ["text_to_video"]},
+        )
+        # A fresh answer is trusted: nothing on the network is asked again, which is
+        # what keeps a render from waiting on a probe it does not need.
+        self.assertEqual(
+            remote_engine.refresh_stale_peers(
+                self.peers_root, max_age=remote_engine.PEER_REFRESH_AFTER
+            ),
+            {PEER_ID: True},
+        )
+        # Past the refresh window the remembered answer is not evidence any more, so
+        # the peer is asked again — and a peer that does not answer stops being a
+        # source, without anyone pressing Probe and without deleting the peer.
+        later = time.time() + remote_engine.PEER_REFRESH_AFTER + 1
+        answers = remote_engine.refresh_stale_peers(
+            self.peers_root, max_age=remote_engine.PEER_REFRESH_AFTER, timeout=0.5, now=later
+        )
+        self.assertEqual(answers, {PEER_ID: False})
+        record = remote_engine.list_peers(self.peers_root, now=later)[0]
+        self.assertEqual(record["peer_id"], PEER_ID)
+        self.assertFalse(record["online"])
+        self.assertIn("Cannot reach", str(record["last_probe"].get("error")))
+        self.assertEqual(remote_engine.generation_sources(self.peers_root, now=later), [])
 
 
 if __name__ == "__main__":

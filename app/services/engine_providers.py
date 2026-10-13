@@ -137,6 +137,10 @@ PROVIDER_KINDS: tuple[str, ...] = (
     "local_engine",
     "compute_node",
     "comfyui",
+    # A free public engine on the internet (services.public_cloud).  Ranked after
+    # everything the user owns or runs on their own network: a public Space runs its
+    # own model, so it approximates the Maestro recipe where a peer replays it.
+    "public_cloud",
     "commercial_api",
 )
 
@@ -436,6 +440,7 @@ def build_registry(
     local_detail: Optional[Mapping[str, Any]] = None,
     comfy_servers: Sequence[Mapping[str, Any]] = (),
     nodes: Sequence[Mapping[str, Any]] = (),
+    public_cloud: Sequence[Mapping[str, Any]] = (),
     commercial: Sequence[Mapping[str, Any]] = (),
 ) -> EngineRegistry:
     """Assemble the registry from what the caller actually measured.
@@ -508,6 +513,33 @@ def build_registry(
                 detail={
                     "online": bool(node.get("online", False)),
                     "last_seen": node.get("last_seen"),
+                },
+            )
+        )
+
+    for entry in public_cloud:
+        provider_id = str(entry.get("provider_id") or "").strip()
+        if not provider_id:
+            continue
+        registry.register(
+            EngineProvider(
+                provider_id=provider_id,
+                label=f"{entry.get('label') or provider_id}",
+                kind="public_cloud",
+                capabilities=tuple(entry.get("capabilities") or ()),
+                local=False,
+                requires_api_key=False,
+                node_id="public",
+                models=tuple(entry.get("models") or ()),
+                notes=str(
+                    entry.get("notes")
+                    or "Free public engine on the internet, connected automatically."
+                ),
+                detail={
+                    "online": bool(entry.get("online", False)),
+                    "free": True,
+                    "hardware": str(entry.get("hardware") or ""),
+                    "address": str(entry.get("address") or ""),
                 },
             )
         )
