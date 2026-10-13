@@ -107,6 +107,57 @@ class ManagedTurboAssetTests(unittest.TestCase):
                 managed_assets.managed_asset_matches(str(asset), revised_spec)
             )
 
+    def test_receipt_detects_a_same_size_rewrite_of_a_large_file_tail(self):
+        """A cached receipt must not hide a replaced tail on a large asset."""
+
+        managed_assets = _load_module("maestro_managed_assets_tail_test", _MANAGED_ASSETS_PATH)
+        payload = bytes(range(256)) * 4096  # 1 MiB, larger than the fingerprint window
+        digest = hashlib.sha256(payload).hexdigest()
+        spec = {
+            "repo_id": "example/turbo",
+            "revision": "revision-a",
+            "remote_path": "turbo.safetensors",
+            "sha256": digest,
+            "size": len(payload),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            asset = Path(temp_dir) / "turbo.safetensors"
+            asset.write_bytes(payload)
+            self.assertTrue(managed_assets.managed_asset_matches(str(asset), spec))
+            # Same length, same mtime (rewritten immediately): only the content
+            # differs, and only outside the head.
+            rewritten = bytearray(payload)
+            rewritten[-64:] = b"z" * 64
+            asset.write_bytes(bytes(rewritten))
+            self.assertFalse(managed_assets.managed_asset_matches(str(asset), spec))
+
+    def test_receipt_without_a_fingerprint_is_reverified(self):
+        """Receipts written before the fingerprint existed are never trusted."""
+
+        managed_assets = _load_module("maestro_managed_assets_stale_test", _MANAGED_ASSETS_PATH)
+        payload = b"maestro-managed-turbo"
+        digest = hashlib.sha256(payload).hexdigest()
+        spec = {
+            "repo_id": "example/turbo",
+            "revision": "revision-a",
+            "remote_path": "turbo.safetensors",
+            "sha256": digest,
+            "size": len(payload),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            asset = Path(temp_dir) / "turbo.safetensors"
+            asset.write_bytes(payload)
+            self.assertTrue(managed_assets.managed_asset_matches(str(asset), spec))
+            receipt_path = Path(managed_assets.managed_asset_receipt_path(str(asset)))
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertTrue(receipt.get("content_fingerprint"))
+            receipt.pop("content_fingerprint")
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            # Still correct, because the fallback re-hashes the whole file.
+            self.assertTrue(managed_assets.managed_asset_matches(str(asset), spec))
+            asset.write_bytes(b"x" * len(payload))
+            self.assertFalse(managed_assets.managed_asset_matches(str(asset), spec))
+
 
 class TurboUpstreamMonitorTests(unittest.TestCase):
     def test_monitor_detects_only_unreviewed_revision(self):

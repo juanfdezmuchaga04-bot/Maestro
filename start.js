@@ -1,4 +1,6 @@
 const {
+  isCpuOnly,
+  isMac,
   isRtx50,
   legacyRuntimeProfile,
   runtimeProfile,
@@ -17,8 +19,13 @@ module.exports = async (kernel) => {
   // conflict-safe dynamic port behavior.
   const port = `{{local.remote_access && local.remote_access.enabled && local.remote_access.pinokio_port_lock && local.remote_access.target_port ? local.remote_access.target_port : ${fallbackPort}}}`
   const runtime = runtimeProfile(kernel)
+  const cpuOnly = isCpuOnly(kernel)
+  const mac = isMac(kernel)
   const legacyRuntime = legacyRuntimeProfile(kernel)
-  const hasRecoveryRuntime = runtime.env !== legacyRuntime.env
+  // The CPU / light environment is never a fallback candidate: launching a CUDA
+  // environment on a machine without an NVIDIA GPU would fail inside the app
+  // instead of reporting the honest CPU state.
+  const hasRecoveryRuntime = !cpuOnly && runtime.env !== legacyRuntime.env
   const selectedEnv = hasRecoveryRuntime
     ? `{{exists('${runtime.marker}') ? '${runtime.env}' : '${legacyRuntime.env}'}}`
     : runtime.env
@@ -31,6 +38,17 @@ module.exports = async (kernel) => {
     params: {
       title: "RTX 50 runtime upgrade required",
       description: "Run Update once to install Maestro's Python 3.11 / CUDA 13 acceleration environment, then start Maestro again. Your existing environment is preserved."
+    },
+    next: null
+  }] : []
+  const cpuGuard = cpuOnly ? [{
+    when: `{{!exists('${runtime.marker}')}}`,
+    method: "input",
+    params: {
+      title: "CPU / light runtime not installed",
+      description: mac
+        ? "macOS has no NVIDIA GPU, so Maestro needs its CPU / light runtime. Run Pinokio's Install action once, then press Start again."
+        : "No NVIDIA GPU was detected, so Maestro needs its CPU / light runtime. Run Pinokio's Install action once, then press Start again."
     },
     next: null
   }] : []
@@ -54,6 +72,7 @@ module.exports = async (kernel) => {
         params: ["url", "port"],
       },
       ...runtimeGuard,
+      ...cpuGuard,
       {
         when: "{{exists('app/settings/remote_access.json')}}",
         method: "json.get",
@@ -89,6 +108,14 @@ module.exports = async (kernel) => {
         method: "log",
         params: {
           raw: "The preferred H3 acceleration runtime is not ready; starting the preserved compatibility runtime. Run Update to finish the automatic migration.",
+        },
+      }] : []),
+      ...(cpuOnly ? [{
+        method: "log",
+        params: {
+          raw: mac
+            ? "macOS detected: starting Maestro with the CPU / light runtime. Editing, planning, the queue and remote engine peers work; local AI generation runs on a machine with an NVIDIA GPU."
+            : "No NVIDIA GPU detected: starting Maestro with the CPU / light runtime. Editing, planning, the queue and remote engine peers work; local AI generation requires an NVIDIA GPU.",
         },
       }] : []),
       {

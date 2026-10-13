@@ -60,10 +60,23 @@ gradio_rangeslider==0.0.8
 opencv-python==4.13.0.92
 ultralytics==8.3.228  # H3 Face Refiner detector; keep the existing Torch stack
 segment-anything==1.0
-rembg[gpu]==2.0.65
-onnxruntime-gpu==1.22.0; python_version < "3.11"
-onnxruntime-gpu==1.25.0.dev20260210001; python_version >= "3.11"
-decord==0.6.0
+# The `gpu` extra pulls onnxruntime-gpu, which does not exist on macOS; Apple
+# machines install the plain package against the CPU runtime added above.
+rembg[gpu]==2.0.65 ; sys_platform != "darwin"
+rembg==2.0.65 ; sys_platform == "darwin"
+# onnxruntime-gpu has no macOS build (no arm64 or x86_64 wheels for any
+# Python), so a bare requirement would abort the macOS install. Apple machines
+# use the CPU runtime instead; its macOS wheels are universal2, so one pin
+# covers both Apple Silicon and Intel. faster-whisper already depends on it.
+onnxruntime-gpu==1.22.0; python_version < "3.11" and sys_platform != "darwin"
+onnxruntime-gpu==1.25.0.dev20260210001; python_version >= "3.11" and sys_platform != "darwin"
+onnxruntime==1.22.0; sys_platform == "darwin"
+# decord 0.6.0 publishes no macOS arm64 wheel and no cp310 macOS wheel at all,
+# so on a Mac it would fail the entire requirements install. EVA's maintained
+# fork ships the same `decord` module (VideoReader + bridge) for cp310 macOS
+# arm64/x86_64, keeping video inputs usable there instead.
+decord==0.6.0 ; sys_platform != "darwin"
+eva-decord==0.6.1 ; sys_platform == "darwin"
 timm==1.0.24
 # insightface: prebuilt Windows wheels hosted on a deepbeepmeep GitHub
 # release mirror (PyPI only ships sdist, which fails to build on Windows

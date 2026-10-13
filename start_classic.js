@@ -1,4 +1,5 @@
 const {
+  isCpuOnly,
   isRtx50,
   legacyRuntimeProfile,
   runtimeProfile,
@@ -7,8 +8,11 @@ const {
 module.exports = async (kernel) => {
   let port = await kernel.port()
   const runtime = runtimeProfile(kernel)
+  const cpuOnly = isCpuOnly(kernel)
   const legacyRuntime = legacyRuntimeProfile(kernel)
-  const hasRecoveryRuntime = runtime.env !== legacyRuntime.env
+  // Same rule as start.js: the CPU / light environment is the runtime itself,
+  // never a fallback to a CUDA environment.
+  const hasRecoveryRuntime = !cpuOnly && runtime.env !== legacyRuntime.env
   const selectedEnv = hasRecoveryRuntime
     ? `{{exists('${runtime.marker}') ? '${runtime.env}' : '${legacyRuntime.env}'}}`
     : runtime.env

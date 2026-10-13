@@ -11,6 +11,14 @@ import uuid
 _RECEIPT_SCHEMA_VERSION = 1
 _RECEIPT_SUFFIX = ".maestro-managed.json"
 
+# Bounded content check used to revalidate a cached receipt. A receipt is only
+# trusted while the file's own metadata *and* this fingerprint still agree, so a
+# same-size in-place replacement is caught by reading 128 KiB instead of
+# re-hashing a multi-gigabyte checkpoint. It is not a substitute for the full
+# SHA-256: an edit that leaves the first and last 64 KiB untouched and also
+# preserves size and mtime is outside what a cached receipt can detect.
+_FINGERPRINT_BYTES = 64 * 1024
+
 
 def managed_asset_receipt_path(path: str) -> str:
     return os.fspath(path) + _RECEIPT_SUFFIX
@@ -34,6 +42,23 @@ def _sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def _content_fingerprint(path: str, size: int) -> str | None:
+    """Digest the head (and, for larger files, the tail) of a file."""
+
+    try:
+        with open(path, "rb") as handle:
+            digest = hashlib.sha256()
+            digest.update(int(size).to_bytes(8, "big"))
+            head = handle.read(_FINGERPRINT_BYTES)
+            digest.update(head)
+            if size > _FINGERPRINT_BYTES:
+                handle.seek(-_FINGERPRINT_BYTES, os.SEEK_END)
+                digest.update(handle.read(_FINGERPRINT_BYTES))
+            return digest.hexdigest()
+    except (OSError, ValueError):
+        return None
+
+
 def write_managed_asset_receipt(
     path: str,
     spec: dict,
@@ -49,6 +74,7 @@ def write_managed_asset_receipt(
         **identity,
         "file_size": int(stat.st_size),
         "file_mtime_ns": int(stat.st_mtime_ns),
+        "content_fingerprint": _content_fingerprint(path, int(stat.st_size)),
         "verified_sha256": str(actual_sha256 or identity["sha256"]).lower(),
     }
     receipt_path = managed_asset_receipt_path(path)
@@ -99,6 +125,13 @@ def managed_asset_matches(path: str, spec: dict) -> bool:
             and int(receipt.get("file_size", -1)) == int(stat.st_size)
             and int(receipt.get("file_mtime_ns", -1)) == int(stat.st_mtime_ns)
             and str(receipt.get("verified_sha256") or "").lower() == expected_sha256
+            # Metadata alone cannot see a same-size rewrite: on filesystems
+            # whose mtime only advances per clock tick, a replaced file can
+            # keep identical size and timestamp. The bounded fingerprint above
+            # is what makes the cached path safe to trust.
+            and str(receipt.get("content_fingerprint") or "")
+            == (_content_fingerprint(path, int(stat.st_size)) or "")
+            and bool(receipt.get("content_fingerprint"))
         ):
             return True
 

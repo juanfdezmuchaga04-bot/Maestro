@@ -3,6 +3,7 @@ env/
 app/env/
 app/env-rtx50/
 app/env-sol/
+app/env-light/
 app/env-ltx25/
 app/env-ltx25-*/
 app/temp/

@@ -3,8 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" href="/maestro-icon.png" />
-    <link rel="apple-touch-icon" sizes="1254x1254" href="/maestro-home-icon-orange.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/maestro-icon-192.png" />
+    <!-- iOS ignores the manifest icons for the Home Screen and uses this link.
+         180x180 is the size current iPhones request; the generator script derives
+         it from the canonical artwork, so it is a ~33 KB request instead of the
+         multi-megabyte logo file. Apple supplies its own rounded mask. -->
+    <link rel="apple-touch-icon" sizes="180x180" href="/maestro-apple-touch-icon.png" />
     <link rel="manifest" href="/manifest.webmanifest" />
+    <!-- `mobile-web-app-capable` is what Android/Chrome reads (the apple-*
+         pair is iOS-only); both are declared so an installed app opens
+         without browser chrome on either platform. -->
+    <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <!-- Keep the Home Screen header below an opaque status bar rather than
          under iOS's translucent shading. -->

@@ -24,6 +24,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Pinokio launcher regression tests
+        # These execute the real launcher scripts with simulated hardware
+        # inventories (NVIDIA, older drivers, AMD/Intel, unknown, forced CPU),
+        # so a change that would make Install stop or route to the wrong
+        # runtime fails here instead of on a user's machine.
+        run: |
+          node tests/launcher_profiles.cjs
+          node tests/startup_readiness.cjs
       - name: Clean-repo boundary guard
         run: python scripts/verify_clean_repo.py
       - name: Python syntax check (our modules)

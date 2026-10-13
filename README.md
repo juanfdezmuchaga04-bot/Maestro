@@ -976,7 +976,7 @@ Initial public release. See [CHANGELOG.md](CHANGELOG.md) for the full feature ru
 
 The first video is always the slow one: install is ~10–20 min, then the first generation on each model downloads its weights (the default video model is ~18 GB). After that, weights are cached and only generation time applies. Maestro's auto-tune sizes the settings to your card on first launch so you don't have to.
 
-> ⚠ **AMD GPUs and macOS are not currently supported.** The pipeline depends on CUDA and several NVIDIA-only kernels. MacOS support is in development.  
+> ⚠ **AMD GPUs and Macs cannot generate locally.** The generation pipeline depends on CUDA and several NVIDIA-only kernels; generation on an AMD card or an Apple GPU is out of scope. **Installing and running Maestro itself is supported on such a machine**: Install never stops without an NVIDIA GPU, it sets up the CPU / light runtime (`app/env-light`) instead, and everything except local generation works — UI, Studio, Films, the editor, planning, FFmpeg assembly, the queue and remote H3 engine peers. Generating from such a machine means sending the work to a computer that has a CUDA GPU. See [Installing without an NVIDIA GPU](docs/INSTALAR-SIN-NVIDIA.md) or, on a Mac, [Installing on a Mac](docs/INSTALAR-EN-MAC.md).  
 
 > ⚠ **Model downloads are large.** A typical install pulls **50–100 GB** of model weights on first launch. The full collection can exceed **300 GB**. Make sure you have headroom on the drive where Pinokio is installed. However, only models requested during generation will be downloaded. 
 
@@ -985,7 +985,7 @@ The first video is always the slow one: install is ~10–20 min, then the first 
 1. Install [Pinokio](https://pinokio.computer).
 2. In Pinokio, open the **Discover** tab and search for *Maestro* — or click the **Download** button on the [Maestro repo page](https://github.com/Blizaine/Maestro) and paste the URL.
 3. Click **Install**. The launcher will:
-   - Create the hardware-matched Python environment: `app/env-sol/` on supported RTX 40-class GPUs, `app/env-rtx50/` on RTX 50-series GPUs, or `app/env/` on other supported NVIDIA GPUs
+   - Create the hardware-matched Python environment: `app/env-sol/` on supported RTX 40-class GPUs, `app/env-rtx50/` on RTX 50-series GPUs, `app/env/` on other supported NVIDIA GPUs, or `app/env-light/` (CPU / light runtime) on a machine where Pinokio reports no NVIDIA GPU — including every Mac, which is recognized from the platform itself so an incomplete GPU inventory cannot mis-route it. A missing NVIDIA GPU no longer stops the install; it only changes which runtime is created.
    - Install all Python dependencies (torch, xformers, transformers, fastapi, …)
    - Build the React UI in `ui/`
 4. When install finishes, click **Start**. The first generation in each model triggers a one-time weight download.
@@ -1008,14 +1008,15 @@ Click **Update** in the launcher menu. This pulls the latest launcher scripts an
 
 The `app/env-sol/` H3 performance environment is removed along with the other Maestro environments.
 
-Click **Reset** to wipe the install and start over. Removes `app/env/`, `app/env-sol/`, `app/env-rtx50/`, `ui/node_modules/`, `ui/dist/`, and the SAM venv if installed. Model checkpoints in `app/ckpts/` are NOT removed by default — delete them manually if you want a true fresh start.
+Click **Reset** to wipe the install and start over. Removes `app/env/`, `app/env-sol/`, `app/env-rtx50/`, `app/env-light/`, `ui/node_modules/`, `ui/dist/`, and the SAM venv if installed. Model checkpoints in `app/ckpts/` are NOT removed by default — delete them manually if you want a true fresh start.
 
 ## Usage
 
 After clicking **Start**, the launcher shows an **Open Web UI** button once the server is up.
 
-- **Top navigation** — switch between Director, Studio, and Editor without leaving the current project
+- **Top navigation** — switch between Director, Studio, Films, and Editor without leaving the current project
 - **Studio sidecar** — workflow and model picker, prompt, references, LoRAs, and advanced settings
+- **Films** — AI production studio: productions that keep a creative brief, imported material with the creative role you assign, an editable storyboard, soundtrack lanes, per-shot generation and an FFmpeg-assembled export. See [docs/FILM-STUDIO.md](docs/FILM-STUDIO.md)
 - **Main workspace** — generated outputs, Director pipeline status, or the full Editor canvas and timeline
 - **Settings drawer** (gear icon) — model visibility, performance auto-tune, services (LLM, API keys, NSFW, theme)
 - **Pinokio menu** — Update, Reset, Install Inpaint Support, LoRA folder shortcuts
@@ -1026,14 +1027,16 @@ Maestro respects Pinokio's `PINOKIO_SHARE_LOCAL` environment variable. Set it to
 
 ## Private HTTPS and phone notifications
 
-For complete first-time setup and troubleshooting, see [Use Maestro Remotely with Tailscale](docs/TAILSCALE_REMOTE_ACCESS.md).
+For complete first-time setup and troubleshooting, see [Use Maestro Remotely with Tailscale](docs/TAILSCALE_REMOTE_ACCESS.md). For the whole phone deployment — production build, the access password, Android installation as an app, connecting the local engine, and maintenance — see **[Maestro from your Android phone](docs/DEPLOY-ANDROID.md)**; for an iPhone or iPad (Safari's Add to Home Screen, the Home Screen icon and the iOS 16.4+ notification rules) see **[Maestro on your iPhone or iPad](docs/DEPLOY-IOS.md)**.
+
+**Before the port is reachable from another device, set an access password.** Maestro has no login on loopback (the browser and the server are the same user); once a phone can reach it, `python scripts/maestro_access.py enable` turns on a signed-cookie sign-in gate with a PBKDF2-stored password. `python scripts/maestro_doctor.py` reports the gate's state, the GPU/CUDA/ffmpeg situation, whether the UI bundle is current, the local engine handshake and the private URL to open from the phone.
 
 Tailscale is optional. Its Personal plan is suitable for an individual connecting their own devices; every Maestro user signs into their own Tailscale account rather than joining a Maestro-owned network.
 
 1. Install Tailscale on the Maestro computer and phone, then sign both into the same account.
 2. Start Maestro. In the Pinokio menu choose **Secure Remote Access (Tailscale)**, or use **Settings → Notifications → Private HTTPS access** when the operating system permits non-elevated setup.
 3. Scan/copy the private `https://…ts.net` address shown in Maestro's Notifications settings.
-4. On iPhone/iPad, open that address in Safari, use **Share → Add to Home Screen**, open the installed Maestro app, and enable **System notifications**.
+4. On iPhone/iPad, open that address in Safari, use **Share → Add to Home Screen**, open the installed Maestro app, and enable **System notifications** (full walkthrough: [Maestro on your iPhone or iPad](docs/DEPLOY-IOS.md)).
 
 The one-time Secure Remote Access action remembers Maestro's actual backend port and reuses it on future starts. On Windows it also registers a fixed, on-demand restore helper for that loopback target, so Maestro can repair the private route on later starts without another UAC prompt. Users who enabled an earlier v2 preview should run the action one final time after updating. `PINOKIO_SHARE_LOCAL_PORT` controls Pinokio's separate LAN proxy and does not need to be set for Tailscale. If the saved port is occupied and Maestro falls back to another one, run Secure Remote Access once to adopt the new port. Disable it from Notifications settings or run `tailscale serve --https=443 off`. Maestro will refuse to overwrite a different existing Serve route. Web Push signing keys and browser subscriptions live only in `app/settings/web_push.json` (a gitignored local file). Notification payloads travel directly from the local Maestro host to the browser vendor's encrypted Web Push endpoint.
 

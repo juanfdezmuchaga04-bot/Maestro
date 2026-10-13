@@ -542,8 +542,8 @@ async function showBrowserNotification(event: MaestroNotificationEvent): Promise
     try {
       await registration.showNotification(event.title, {
         body: event.body,
-        icon: '/maestro-icon.png',
-        badge: '/maestro-icon.png',
+        icon: '/maestro-icon-192.png',
+        badge: '/maestro-icon-192.png',
         tag: event.key,
         silent: true,
         data: { url: window.location.href },
@@ -558,7 +558,7 @@ async function showBrowserNotification(event: MaestroNotificationEvent): Promise
   try {
     const notification = new Notification(event.title, {
       body: event.body,
-      icon: '/maestro-icon.png',
+      icon: '/maestro-icon-192.png',
       tag: event.key,
       silent: true,
     })

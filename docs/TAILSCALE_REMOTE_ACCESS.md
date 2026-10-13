@@ -107,6 +107,30 @@ closed-app notifications on iPhone and iPad.
 If Maestro was previously installed from a local `http://` address, remove that
 old Home Screen shortcut and add it again from the Tailscale `https://` address.
 
+On **Android**, open the same HTTPS address in Chrome, sign in if the access
+gate is on, then use Chrome's menu → **Install app** / **Add to Home screen**.
+Chrome only offers that for an `https://` address, which is exactly what this
+Tailscale route provides. See
+[Maestro from your Android phone](DEPLOY-ANDROID.md) for the full walkthrough.
+
+## Before you expose the port: set an access password
+
+Tailscale keeps the route private to your own devices, and that is already a real
+access control. If you also want a password in front of the API — for example when
+`PINOKIO_SHARE_LOCAL=true`, or simply so a borrowed phone cannot drive the studio
+— enable Maestro's sign-in gate once on the host:
+
+```bash
+python scripts/maestro_access.py enable     # prints the password once
+python scripts/maestro_doctor.py            # confirms the state of everything else
+```
+
+It adds a signed-cookie sign-in page in front of every API and media request, keeps
+the manifest, icon and offline page public so the app can still install and explain
+itself, locks an address out for five minutes after five wrong passwords, and writes
+only a PBKDF2 hash to `app/settings/access_gate.json`. Sign out on a device by
+opening `/api/v1/access/logout`. Full detail: [Maestro from your Android phone](DEPLOY-ANDROID.md).
+
 ## Enable completion notifications
 
 On the remote device:

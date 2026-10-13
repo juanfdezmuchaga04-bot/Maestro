@@ -1,4 +1,6 @@
 const {
+  isCpuOnly,
+  isMac,
   isSolCapable,
   needsCuda13DriverUpdate,
   runtimeProfile,
@@ -34,18 +36,23 @@ const localWebEndpoint = (local) => {
 module.exports = {
   version: "8.0",
   title: "Maestro",
-  description: "An all-in-one, 100% local AI creative studio, director, and multi-track editor. Generate with MiniMax H3, LTX-2.5/2.3, Wan, Flux, Qwen, and more; turn an idea or song into a planned production; then finish it on the timeline. Requires an NVIDIA GPU (6GB+ VRAM).",
+  description: "An all-in-one, 100% local AI creative studio, director, and multi-track editor. Generate with MiniMax H3, LTX-2.5/2.3, Wan, Flux, Qwen, and more; turn an idea or song into a planned production; then finish it on the timeline. Local generation requires an NVIDIA GPU (6GB+ VRAM); on macOS, AMD/Intel machines and any other GPU-less computer Maestro installs a CPU / light runtime where everything except local generation still works — production and generation then run on a machine with a CUDA GPU.",
   icon: "maestro_simplified_icon_alpha.png",
   menu: async (kernel, info) => {
     const runtime = runtimeProfile(kernel)
     const solCapable = isSolCapable(kernel)
+    const cpuOnly = isCpuOnly(kernel)
+    const mac = isMac(kernel)
     const cuda13DriverUpdateRequired = solCapable && needsCuda13DriverUpdate(kernel)
     const samReady = info.exists("app/services/sam/env/.maestro-sam-ready")
     // Do not gate this menu on kernel.gpu. Pinokio can render an app menu
     // before its hardware inventory has populated that property, which would
     // hide Start from supported systems. install.js retains the documented
     // execution-time NVIDIA check for fresh installations.
-    let installed = info.exists("app/env") || info.exists("app/env-rtx50") || info.exists("app/env-sol")
+    let installed = info.exists("app/env")
+      || info.exists("app/env-rtx50")
+      || info.exists("app/env-sol")
+      || info.exists("app/env-light")
     let runtimeReady = info.exists(runtime.marker) && info.exists(runtime.flashMarker)
     let running = {
       install: info.running("install.js"),
@@ -182,7 +189,11 @@ module.exports = {
       } else {
         return [{
           icon: "fa-solid fa-power-off",
-          text: "Start",
+          text: cpuOnly
+            ? (mac
+              ? "<div><strong>Start</strong><div>CPU / light runtime — macOS has no NVIDIA GPU, so Studio, Films, the queue and remote GPU nodes work and local AI generation does not</div></div>"
+              : "<div><strong>Start</strong><div>CPU / light runtime — no NVIDIA GPU detected, so local AI generation is unavailable</div></div>")
+            : "Start",
           href: "start.js",
         }, {
           icon: "fa-solid fa-shield-halved",
@@ -225,20 +236,24 @@ module.exports = {
           icon: "fa-solid fa-key",
           text: "<div><strong>Connect Hugging Face (Optional)</strong><div>For custom gated models or higher download limits. Not required for Maestro.</div></div>",
           href: "huggingface_login.js",
-        }, {
+        }, ...(cpuOnly ? [] : [{
           // Install / re-install the SAM 3.1 segmentation service
-          // (separate Python 3.12 conda env, takes ~5 min). Only
-          // needed for the experimental Inpaint feature in Edit
+          // (separate Python 3.12 conda env + CUDA PyTorch, takes ~5 min).
+          // Only needed for the experimental Inpaint feature in Edit
           // mode — most users never need it, which is why install.js
           // no longer runs sam_install.js automatically. Label flips
           // to "Update Inpaint Support" only after the installer's dependency
           // and import health checks pass, so a partial env is never reported ready.
+          //
+          // Hidden on the CPU / light runtime (macOS, AMD/Intel, no NVIDIA):
+          // the installer builds a CUDA 12.8 environment that cannot exist there,
+          // so offering it would only produce a failing action.
           icon: "fa-solid fa-vector-square",
           text: samReady
             ? "Update Inpaint Support (SAM 3.1)"
             : "Install Inpaint Support (SAM 3.1)",
           href: "sam_install.js",
-        }, {
+        }]), {
           icon: "fa-regular fa-circle-xmark",
           text: "<div><strong>Reset</strong><div>Revert to pre-install state</div></div>",
           href: "reset.js",

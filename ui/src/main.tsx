@@ -2,6 +2,12 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
+import { installSignInRedirect } from './lib/session'
+
+// A 401 means the backend's optional sign-in gate wants a password again; the
+// next navigation shows its sign-in page. Installed before React mounts so no
+// early request can slip past it.
+installSignInRedirect()
 
 // Mobile browsers require persistent notifications from a service worker;
 // `new Notification()` is desktop-only on several engines, including iOS

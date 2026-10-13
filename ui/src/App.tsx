@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useCallback, useEffect } from 'react'
 import { Menu, Settings } from 'lucide-react'
 import { Sidebar } from './components/Sidebar/Sidebar'
 import { MainContent } from './components/MainContent/MainContent'
@@ -14,8 +14,10 @@ import { WelcomeModal } from './components/WelcomeModal'
 import { RecipesOverlay } from './components/Recipes/RecipesOverlay'
 import { GlobalQueuePopover } from './components/GlobalQueuePopover'
 import { NotificationCoordinator } from './components/NotificationCoordinator'
+import { OfflineBanner } from './components/OfflineBanner'
 import { NotificationToastHost } from './components/NotificationToastHost'
 import { EditorWorkspace } from './editor/EditorWorkspace'
+import { StudioWorkspace } from './studio/StudioWorkspace'
 import { MaestroBrand } from './components/AppModeNavigation'
 import { EditorRoundTripBanner } from './editor/EditorRoundTripBanner'
 import { useStore } from './stores/useStore'
@@ -37,6 +39,8 @@ function App() {
   const sidebarMode = useStore(s => s.sidebarMode)
   const isMobile = useIsMobileSidecar()
   const isEditor = sidebarMode === 'editor'
+  // Films and the Editor both take the whole canvas instead of the Studio sidecar.
+  const isFullCanvas = isEditor || sidebarMode === 'productions'
 
   useEffect(() => {
     loadModels()
@@ -57,10 +61,22 @@ function App() {
     return () => clearInterval(interval)
   }, [loadLlmStatus])
 
+  // A phone loses its connection routinely (Wi-Fi, Tailscale, the computer
+  // sleeping). When it comes back, re-run the same loaders as startup so the
+  // queue and gallery are real again instead of whatever they showed before.
+  const refreshAfterReconnect = useCallback(() => {
+    reconnectJobs()
+    void loadOutputs()
+    loadSystemConfig()
+    loadServicesConfig()
+    loadLlmStatus()
+    loadPipelineList()
+  }, [reconnectJobs, loadOutputs, loadSystemConfig, loadServicesConfig, loadLlmStatus, loadPipelineList])
+
   return (
-    <div className={`flex ${isMobile && !isEditor ? 'flex-col' : 'flex-col md:flex-row'} h-full w-full bg-bg-primary`}>
+    <div className={`flex ${isMobile && !isFullCanvas ? 'flex-col' : 'flex-col md:flex-row'} h-full w-full bg-bg-primary`}>
       {/* Mobile header */}
-      {isMobile && !isEditor && (
+      {isMobile && !isFullCanvas && (
         <header className="h-12 shrink-0 grid grid-cols-[1fr_auto_1fr] items-center gap-1 px-2 border-b border-border bg-bg-secondary">
           <button
             onClick={toggleSidebar}
@@ -68,8 +84,7 @@ function App() {
             className="justify-self-start p-2 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
           >
             <Menu size={20} />
-          </button>
-          <MaestroBrand />
+          </button>              <MaestroBrand />
           <div className="justify-self-end flex items-center gap-0.5">
             <GlobalQueuePopover iconSize={20} panelAlign="header-edge" />
             <button
@@ -83,7 +98,9 @@ function App() {
         </header>
       )}
 
-      {isEditor ? (
+      {sidebarMode === 'productions' ? (
+        <StudioWorkspace />
+      ) : isEditor ? (
         <EditorWorkspace />
       ) : (
         <>
@@ -118,6 +135,7 @@ function App() {
           Toasts remain useful even when browser notifications are disabled. */}
       <NotificationCoordinator />
       <NotificationToastHost />
+      <OfflineBanner onReconnect={refreshAfterReconnect} />
       <EditorRoundTripBanner />
     </div>
   )

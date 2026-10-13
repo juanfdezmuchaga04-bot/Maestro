@@ -1,4 +1,7 @@
 const {
+  isCpuOnly,
+  isMac,
+  isRtx50,
   isSolCapable,
   needsCuda13DriverUpdate,
   runtimeProfile,
@@ -6,26 +9,61 @@ const {
 
 module.exports = async (kernel) => {
   const runtime = runtimeProfile(kernel)
+  const cpuOnly = isCpuOnly(kernel)
+  const mac = isMac(kernel)
   return {
     requires: {
       bundle: "ai"
     },
     run: [
     {
+      // Pinokio's documented GPU variable stays the trigger, but it no longer
+      // stops the install. A machine without an NVIDIA GPU still gets a
+      // complete install: the studio, Films, editor, queue and remote engine
+      // peers work, and the app's own startup preflight reports that local
+      // generation needs CUDA. See docs/INSTALAR-SIN-NVIDIA.md.
       when: "{{gpu !== 'nvidia'}}",
       method: "notify",
       params: {
-        html: "This app requires an NVIDIA GPU on Windows or Linux."
+        // Interpolated here rather than with {{gpu}}: this step runs precisely
+        // when that value is missing or unrecognized, so it must not depend on
+        // the template engine resolving it.
+        html: mac
+          ? `macOS detected (${kernel.gpu || "Apple GPU"}). Installing Maestro's `
+            + "CPU / light runtime: planning, Studio, Films, the editor, the queue "
+            + "and remote engine peers all work. Local AI generation needs an "
+            + "NVIDIA GPU, so it stays on another machine. Needs an Apple Silicon "
+            + "Mac on macOS 14 or newer. See docs/INSTALAR-EN-MAC.md."
+          : cpuOnly
+            ? `No NVIDIA GPU reported (${kernel.gpu || "not reported"}). Installing `
+              + "Maestro's CPU / light runtime: planning, Studio, Films, the editor, "
+              + "the queue and remote engine peers all work, but local AI generation "
+              + "needs an NVIDIA GPU. See docs/INSTALAR-SIN-NVIDIA.md."
+            : `Pinokio did not report an NVIDIA GPU (${kernel.gpu || "not reported"}). `
+              + "Continuing with Maestro's standard NVIDIA runtime. If this machine "
+              + "has no NVIDIA GPU, set MAESTRO_CPU_RUNTIME=1 in Pinokio's ENVIRONMENT "
+              + "file and run Install again to get the lighter CPU runtime instead."
+      }
+    },
+    {
+      // Blackwell (RTX 50) has no CUDA 12.8 fallback for the H3 runtime, so this
+      // stays a stop-and-explain gate.
+      when: isRtx50(kernel) && needsCuda13DriverUpdate(kernel),
+      method: "notify",
+      params: {
+        html: `Your NVIDIA driver (${kernel.gpu_driver}) is too old for Maestro's CUDA 13 runtime. Update to NVIDIA driver 580 or newer, then run Install again.`
       },
       next: null
     },
     {
-      when: isSolCapable(kernel) && needsCuda13DriverUpdate(kernel),
+      // Every other NVIDIA card already has a working CUDA 12.8 compatibility
+      // runtime (runtimeProfile selects it below), so warn instead of blocking
+      // an install that can still generate.
+      when: isSolCapable(kernel) && !isRtx50(kernel) && needsCuda13DriverUpdate(kernel),
       method: "notify",
       params: {
-        html: `Your NVIDIA driver (${kernel.gpu_driver}) is too old for Maestro's default CUDA 13 H3 runtime. Update to NVIDIA driver 580 or newer, then run Install again.`
-      },
-      next: null
+        html: `Your NVIDIA driver (${kernel.gpu_driver}) is too old for Maestro's CUDA 13 H3 performance runtime, so Install will use the CUDA 12.8 compatibility runtime instead. Update to NVIDIA driver 580 or newer and run Update afterwards to get the faster runtime.`
+      }
     },
     {
       method: "shell.run",
@@ -103,7 +141,15 @@ module.exports = async (kernel) => {
       method: 'input',
       params: {
         title: 'Installation completed',
-        description: 'Click "Start" to get started'
+        description: mac
+          ? 'Install finished with the macOS CPU / light runtime. Click "Start": every '
+            + 'part of Maestro except local AI generation is available on this Mac (see '
+            + 'docs/INSTALAR-EN-MAC.md).'
+          : cpuOnly
+            ? 'Install finished with the CPU / light runtime. Click "Start": every '
+              + 'part of Maestro except local AI generation is available (see '
+              + 'docs/INSTALAR-SIN-NVIDIA.md).'
+            : 'Click "Start" to get started'
       }
     }
     ]

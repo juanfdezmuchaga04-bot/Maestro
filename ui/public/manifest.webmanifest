@@ -6,20 +6,35 @@
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
+  "orientation": "any",
+  "lang": "en",
+  "categories": ["video", "graphics", "productivity"],
   "background_color": "#0a0a0a",
   "theme_color": "#0a0a0a",
   "icons": [
     {
-      "src": "/maestro-home-icon-orange.png",
-      "sizes": "1254x1254",
+      "src": "/maestro-icon-192.png",
+      "sizes": "192x192",
       "type": "image/png",
       "purpose": "any"
+    },
+    {
+      "src": "/maestro-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/maestro-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
     },
     {
       "src": "/maestro-home-icon-orange.png",
       "sizes": "1254x1254",
       "type": "image/png",
-      "purpose": "maskable"
+      "purpose": "any"
     }
   ]
 }

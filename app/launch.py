@@ -92,6 +92,12 @@ from services.editor_projects import (
     resolve_editor_media_cache_file,
     save_editor_project,
 )
+from services import compute_nodes as compute_nodes_service
+from services import film_api as film_api_service
+from services import comfy_jobs as comfy_jobs_service
+from services import local_engine_api as local_engine_api_service
+from services import production_queue_api
+from services import remote_engine as remote_engine_service
 
 # Protect upgraded installations before WanGP builds its model registry.  Old
 # CivitAI imports could pair any checkpoint with any Maestro architecture; hide
@@ -313,10 +319,22 @@ def _safe_join(base: str, *parts: str) -> str | None:
     except (ValueError, OSError):
         return None
 
+# Sign-in gate — off unless a password or MAESTRO_ACCESS_TOKEN is configured, so
+# loopback users keep the zero-friction behaviour. It exists because the same
+# backend can be reached from a phone (Pinokio LAN share or a Tailscale route),
+# and without it anything on that network could drive generation and media
+# access. Registered BEFORE CORS on purpose: Starlette applies middleware
+# last-added-first, so CORS stays outermost and a 401 keeps its CORS headers.
+from services.access_gate import AccessGate as _AccessGate, install_access_gate
+
+_maestro_access_gate = _AccessGate(_maestro_settings_dir)
+install_access_gate(api, _maestro_access_gate)
+
 # CORS — restricted to localhost (the Vite dev server + the bundled UI
 # served from the same FastAPI process + Pinokio's HTTPS proxy at
-# https://<port>.localhost). Do NOT loosen this to `*` — the API has
-# no authentication and would be trivially CSRF'able from any site.
+# https://<port>.localhost). Do NOT loosen this to `*` — the API would be
+# trivially CSRF'able from any site, which is also why the sign-in gate above
+# defaults to the same-origin-only posture instead of a wildcard.
 _cors_origin_regex = r"^https?://(127\.0\.0\.1|localhost|\d+\.localhost)(:\d+)?$"
 api.add_middleware(
     CORSMiddleware,
@@ -7451,7 +7469,11 @@ def system_preflight():
                        "export will fail. Install ffmpeg and restart Maestro.",
         })
 
-    # CUDA — the generation pipeline is NVIDIA-only.
+    # CUDA — the generation pipeline is NVIDIA-only. This is a deliberate
+    # capability report, not a startup blocker: a CPU / light install (Pinokio's
+    # app/env-light, used when no NVIDIA GPU is present) still runs planning,
+    # Studio, Films, the editor, the queue and remote engine peers. Name the
+    # next step so the message is actionable on those machines.
     try:
         import torch as _torch
         if not _torch.cuda.is_available():
@@ -7459,8 +7481,10 @@ def system_preflight():
                 "id": "cuda",
                 "level": "error",
                 "message": "No CUDA GPU detected. Maestro's generation "
-                           "pipeline requires an NVIDIA GPU; generation will "
-                           "not work on this machine.",
+                           "pipeline requires an NVIDIA GPU; local generation "
+                           "will not work on this machine. Planning, media and "
+                           "assembly are available, and generation can run on a "
+                           "remote H3 engine peer (see docs/STUDIO-NODES.md).",
             })
     except Exception:
         checks.append({
@@ -30132,29 +30156,8 @@ def editor_export_capability_list():
     return editor_export_capabilities()
 
 
-@api.post("/api/v1/editor/export")
-async def editor_export(request: Request):
-    body = await request.json()
-    workspace = body.get("workspace") or _get_active_workspace()
-    queue_mode = str(body.get("queue_mode") or "now").lower()
-    if queue_mode not in {"now", "held"}:
-        raise HTTPException(status_code=400, detail="queue_mode must be 'now' or 'held'")
-    hold_for_queue = queue_mode == "held"
-    try:
-        project = body.get("project")
-        if not isinstance(project, dict):
-            project_id = str(body.get("project_id") or "")
-            project = load_editor_project(
-                _editor_save_root(),
-                workspace,
-                project_id,
-            )
-        project = save_editor_project(_editor_save_root(), workspace, project)
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail="Editor project not found") from error
-    except EditorProjectError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-
+def _queue_editor_export(project: dict, workspace: str, hold_for_queue: bool) -> dict:
+    """Queue an Editor render. Shared by the Editor and the Studio's export."""
     job_id = uuid.uuid4().hex[:8]
     _jobs[job_id] = {
         "id": job_id,
@@ -30180,6 +30183,1540 @@ async def editor_export(request: Request):
             name=f"maestro_editor_export_{job_id}",
         ).start()
     return {"job_id": job_id, "status": "held" if hold_for_queue else "queued"}
+
+
+@api.post("/api/v1/editor/export")
+async def editor_export(request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    queue_mode = str(body.get("queue_mode") or "now").lower()
+    if queue_mode not in {"now", "held"}:
+        raise HTTPException(status_code=400, detail="queue_mode must be 'now' or 'held'")
+    hold_for_queue = queue_mode == "held"
+    try:
+        project = body.get("project")
+        if not isinstance(project, dict):
+            project_id = str(body.get("project_id") or "")
+            project = load_editor_project(
+                _editor_save_root(),
+                workspace,
+                project_id,
+            )
+        project = save_editor_project(_editor_save_root(), workspace, project)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Editor project not found") from error
+    except EditorProjectError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    return _queue_editor_export(project, workspace, hold_for_queue)
+
+
+# ============================================================================
+# Maestro Studio — AI film production projects
+#
+# Everything below is a thin HTTP shell over services.film_api, which owns the
+# production logic (persistence, intake, brief, storyboard, queue bookkeeping,
+# assembly). Generation itself goes through the same submission path as
+# /api/v1/generate, and assembly through the same FFmpeg renderer as the Editor.
+# ============================================================================
+
+
+def _film_save_root() -> str:
+    return _editor_save_root()
+
+
+def _film_uploads_root() -> str:
+    return _editor_uploads_root()
+
+
+def _film_job_lookup(job_id: str):
+    job = _jobs.get(job_id)
+    if not isinstance(job, dict):
+        return None
+    return {
+        "status": job.get("status"),
+        "error": job.get("error"),
+        "output_files": list(job.get("output_files") or []),
+    }
+
+
+def _film_http_error(error: Exception) -> HTTPException:
+    if isinstance(error, FileNotFoundError):
+        return HTTPException(status_code=404, detail="Production project not found")
+    if isinstance(error, film_api_service.FilmProjectError):
+        return HTTPException(status_code=400, detail=str(error))
+    if isinstance(error, (TypeError, ValueError)):
+        return HTTPException(status_code=400, detail=str(error))
+    traceback.print_exc()
+    return HTTPException(status_code=500, detail=str(error)[:500])
+
+
+@api.get("/api/v1/film/projects")
+def film_projects_list(workspace: str = ""):
+    workspace = workspace or _get_active_workspace()
+    try:
+        return film_api_service.list_projects(_film_save_root(), workspace)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects")
+async def film_project_create(request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    try:
+        project = body.get("project")
+        if isinstance(project, dict):
+            return film_api_service.save_project(_film_save_root(), workspace, project)
+        return film_api_service.create_project(
+            _film_save_root(),
+            workspace,
+            name=body.get("name") or "Untitled production",
+            brief=body.get("brief") if isinstance(body.get("brief"), dict) else None,
+            approach=str(body.get("approach") or "hybrid"),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.get("/api/v1/film/engine")
+def film_engine_status():
+    return film_api_service.engine_status()
+
+
+@api.get("/api/v1/film/projects/{project_id}")
+def film_project_get(project_id: str, workspace: str = ""):
+    workspace = workspace or _get_active_workspace()
+    try:
+        return film_api_service.get_project(_film_save_root(), workspace, project_id)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.put("/api/v1/film/projects/{project_id}")
+async def film_project_update(project_id: str, request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    project = body.get("project") if isinstance(body.get("project"), dict) else body
+    project = dict(project)
+    project["id"] = project_id
+    try:
+        return film_api_service.save_project(_film_save_root(), workspace, project)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.delete("/api/v1/film/projects/{project_id}")
+def film_project_delete(project_id: str, workspace: str = ""):
+    workspace = workspace or _get_active_workspace()
+    try:
+        return film_api_service.delete_project(_film_save_root(), workspace, project_id)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.get("/api/v1/film/projects/{project_id}/overview")
+async def film_project_overview(project_id: str, workspace: str = ""):
+    workspace = workspace or _get_active_workspace()
+    try:
+        # The overview builds the assembly plan, which shells out to a local
+        # probe; keep it off the event loop.
+        overview = await asyncio.to_thread(
+            film_api_service.project_overview, _film_save_root(), workspace, project_id
+        )
+        overview["engine"] = film_api_service.engine_status()
+        return overview
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.put("/api/v1/film/projects/{project_id}/brief")
+async def film_brief_update(project_id: str, request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    patch = body.get("brief") if isinstance(body.get("brief"), dict) else body
+    try:
+        if body.get("approach"):
+            patch = {**dict(patch), "approach": body["approach"]}
+        return film_api_service.update_brief(
+            _film_save_root(), workspace, project_id, patch
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.get("/api/v1/film/projects/{project_id}/brief")
+async def film_brief_get(project_id: str, workspace: str = ""):
+    workspace = workspace or _get_active_workspace()
+    try:
+        return await asyncio.to_thread(
+            film_api_service.brief_bundle,
+            _film_save_root(),
+            workspace,
+            project_id,
+            uploads_root=_film_uploads_root(),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects/{project_id}/assets")
+async def film_assets_import(project_id: str, request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    files = body.get("files")
+    if not isinstance(files, list):
+        raise HTTPException(status_code=400, detail="files must be a list")
+    try:
+        return await asyncio.to_thread(
+            film_api_service.import_assets,
+            _film_save_root(),
+            workspace,
+            project_id,
+            files,
+            analyze=bool(body.get("analyze")),
+            deep_audio=bool(body.get("deep_audio")),
+            uploads_root=_film_uploads_root(),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.put("/api/v1/film/projects/{project_id}/assets/{asset_id}")
+async def film_asset_update(project_id: str, asset_id: str, request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    role = str(body.get("role") or "").strip()
+    try:
+        if role:
+            return film_api_service.set_asset_role(
+                _film_save_root(),
+                workspace,
+                project_id,
+                asset_id,
+                role=role,
+                notes=str(body.get("notes") or ""),
+                display_name=str(body.get("display_name") or ""),
+                reproduce_literally=body.get("reproduce_literally"),
+                keep_original=body.get("keep_original"),
+            )
+        project = film_api_service.get_project(_film_save_root(), workspace, project_id)
+        from services.film_projects import update_asset as _update_film_asset
+
+        _update_film_asset(project, asset_id, body)
+        return film_api_service.save_project(_film_save_root(), workspace, project)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.delete("/api/v1/film/projects/{project_id}/assets/{asset_id}")
+def film_asset_delete(project_id: str, asset_id: str, workspace: str = ""):
+    workspace = workspace or _get_active_workspace()
+    try:
+        return film_api_service.remove_project_asset(
+            _film_save_root(), workspace, project_id, asset_id
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects/{project_id}/assets/analyze")
+async def film_assets_analyze(project_id: str, request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    asset_ids = body.get("asset_ids") if isinstance(body.get("asset_ids"), list) else None
+    try:
+        return await asyncio.to_thread(
+            film_api_service.analyze_project_assets,
+            _film_save_root(),
+            workspace,
+            project_id,
+            asset_ids=asset_ids,
+            deep_audio=bool(body.get("deep_audio")),
+            uploads_root=_film_uploads_root(),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects/{project_id}/plan/import")
+async def film_plan_import(project_id: str, request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    response = body.get("response") if isinstance(body.get("response"), dict) else body.get("plan")
+    if not isinstance(response, dict):
+        raise HTTPException(status_code=400, detail="response must be a Director response object")
+    try:
+        return film_api_service.import_plan(
+            _film_save_root(),
+            workspace,
+            project_id,
+            response,
+            imported_from=str(body.get("imported_from") or ""),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects/{project_id}/references")
+async def film_references_assign(project_id: str, request: Request):
+    """Attach specific images to specific shots or whole scenes."""
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    asset_ids = body.get("asset_ids") if isinstance(body.get("asset_ids"), list) else []
+    shot_ids = body.get("shot_ids") if isinstance(body.get("shot_ids"), list) else []
+    scene_ids = body.get("scene_ids") if isinstance(body.get("scene_ids"), list) else []
+    try:
+        return film_api_service.assign_references(
+            _film_save_root(),
+            workspace,
+            project_id,
+            asset_ids=asset_ids,
+            shot_ids=shot_ids,
+            scene_ids=scene_ids,
+            all_shots=bool(body.get("all_shots")),
+            as_start_image=bool(body.get("as_start_image")),
+            replace=bool(body.get("replace")),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects/{project_id}/continuity")
+async def film_continuity_apply(project_id: str, request: Request):
+    """Carry the character bible into every shot that features those characters."""
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    try:
+        return film_api_service.apply_continuity(
+            _film_save_root(), workspace, project_id, replace=bool(body.get("replace")),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.get("/api/v1/film/projects/{project_id}/storyboard")
+def film_storyboard(project_id: str, workspace: str = "", only_missing: bool = True):
+    workspace = workspace or _get_active_workspace()
+    try:
+        return film_api_service.storyboard_view(
+            _film_save_root(), workspace, project_id, only_missing=only_missing
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects/{project_id}/shots")
+async def film_shot_add(project_id: str, request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    shot = body.get("shot") if isinstance(body.get("shot"), dict) else body
+    try:
+        return film_api_service.add_shot(_film_save_root(), workspace, project_id, shot)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.put("/api/v1/film/projects/{project_id}/shots/{shot_id}")
+async def film_shot_update(project_id: str, shot_id: str, request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    patch = body.get("shot") if isinstance(body.get("shot"), dict) else body
+    try:
+        return film_api_service.edit_shot(
+            _film_save_root(), workspace, project_id, shot_id, patch
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.delete("/api/v1/film/projects/{project_id}/shots/{shot_id}")
+def film_shot_delete(project_id: str, shot_id: str, workspace: str = ""):
+    workspace = workspace or _get_active_workspace()
+    try:
+        return film_api_service.delete_shot(_film_save_root(), workspace, project_id, shot_id)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects/{project_id}/shots/{shot_id}/move")
+async def film_shot_move(project_id: str, shot_id: str, request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    try:
+        return film_api_service.reorder_shot(
+            _film_save_root(), workspace, project_id, shot_id, int(body.get("index") or 0)
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects/{project_id}/shots/{shot_id}/approve")
+async def film_shot_approve(project_id: str, shot_id: str, request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    try:
+        return film_api_service.approve_shot_take(
+            _film_save_root(), workspace, project_id, shot_id, int(body.get("take_index") or 0)
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects/{project_id}/shots/{shot_id}/takes")
+async def film_shot_take_add(project_id: str, shot_id: str, request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    take = body.get("take") if isinstance(body.get("take"), dict) else body
+    try:
+        return film_api_service.register_take(
+            _film_save_root(), workspace, project_id, shot_id, take
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.get("/api/v1/film/projects/{project_id}/production")
+def film_production_plan(project_id: str, workspace: str = "", only_missing: bool = True):
+    workspace = workspace or _get_active_workspace()
+    try:
+        return film_api_service.production_plan(
+            _film_save_root(),
+            workspace,
+            project_id,
+            only_missing=only_missing,
+            model_available=film_api_service.engine_status()["generation_possible"],
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects/{project_id}/produce")
+async def film_produce(project_id: str, request: Request):
+    """Submit storyboard shots to the real generation queue.
+
+    ``params`` is the Studio's own validated parameter set (model, resolution,
+    LoRAs, steps...). The Studio only overrides the prompt and, when asked, the
+    shot's reference images, so the model settings stay exactly what the user
+    configured in the sidecar.
+    """
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    params = body.get("params") if isinstance(body.get("params"), dict) else None
+    if not params:
+        raise HTTPException(
+            status_code=400,
+            detail="params is required: open the Studio sidecar so the model settings are loaded.",
+        )
+    shot_ids = body.get("shot_ids") if isinstance(body.get("shot_ids"), list) else None
+    try:
+        plan = film_api_service.production_plan(
+            _film_save_root(),
+            workspace,
+            project_id,
+            only_missing=bool(body.get("only_missing", True)),
+            shot_ids=shot_ids,
+            model_available=film_api_service.engine_status()["generation_possible"],
+        )
+        runnable = plan["runnable"][: int(body.get("limit") or 200)]
+        if not runnable:
+            return {"submitted": [], "skipped": plan["skipped"], "readiness": plan["readiness"]}
+
+        project = film_api_service.get_project(_film_save_root(), workspace, project_id)
+        submitted = []
+        failures = []
+        for item in runnable:
+            shot_params = dict(params)
+            shot_params["prompt"] = item["prompt"] or item["image_prompt"]
+            shot_params["workspace"] = workspace
+            if body.get("apply_references", True):
+                resolved = _film_shot_reference_paths(project, item, workspace)
+                if resolved.get("start_image"):
+                    shot_params["image_start"] = resolved["start_image"]
+                if resolved.get("references"):
+                    shot_params["image_refs"] = resolved["references"]
+                if resolved.get("missing"):
+                    failures.append({
+                        "shot_id": item["shot_id"],
+                        "error": f"Missing reference file(s): {', '.join(resolved['missing'])}",
+                    })
+                    continue
+            shot_params["_client_submission_id"] = f"film-{project_id}-{item['shot_id']}"
+            try:
+                result = await _prepare_generation_submission(shot_params)
+            except HTTPException as error:
+                failures.append({"shot_id": item["shot_id"], "error": str(error.detail)})
+                continue
+            except Exception as error:  # noqa: BLE001 - report, keep going
+                failures.append({"shot_id": item["shot_id"], "error": str(error)[:300]})
+                continue
+            submitted.append({
+                "shot_id": item["shot_id"],
+                "job_id": result.get("job_id"),
+                "kind": "video" if params.get("generation_mode") != "image" else "image",
+                "params": {"prompt": shot_params["prompt"]},
+            })
+        recorded = film_api_service.record_production_jobs(
+            _film_save_root(), workspace, project_id, submitted
+        ) if submitted else {"project": project, "recorded": []}
+        return {
+            "submitted": submitted,
+            "failures": failures,
+            "skipped": plan["skipped"],
+            "project": recorded["project"],
+        }
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+def _film_shot_reference_paths(project: dict, item: dict, workspace: str) -> dict:
+    from services.film_planning import reference_files_for_shot
+
+    def resolve(asset):
+        from services.film_brief import resolve_asset_path
+
+        return resolve_asset_path(
+            {"filename": asset.get("filename")},
+            uploads_root=_film_uploads_root(),
+            save_root=_film_save_root(),
+            workspace=workspace,
+        )
+
+    return reference_files_for_shot(project, str(item["shot_id"]), resolve=resolve)
+
+
+@api.post("/api/v1/film/projects/{project_id}/production/sync")
+def film_production_sync(project_id: str, workspace: str = ""):
+    workspace = workspace or _get_active_workspace()
+    try:
+        return film_api_service.sync_production_jobs(
+            _film_save_root(), workspace, project_id, _film_job_lookup
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects/{project_id}/soundtrack")
+def film_soundtrack_plan(project_id: str, workspace: str = ""):
+    workspace = workspace or _get_active_workspace()
+    try:
+        return film_api_service.plan_soundtrack(_film_save_root(), workspace, project_id)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects/{project_id}/soundtrack/sync")
+async def film_soundtrack_sync(project_id: str, request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    try:
+        return film_api_service.sync_cuts_to_music(
+            _film_save_root(),
+            workspace,
+            project_id,
+            tolerance_sec=float(body.get("tolerance_sec") or 1.5),
+            apply_changes=bool(body.get("apply_changes")),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.get("/api/v1/film/projects/{project_id}/assembly")
+async def film_assembly_status(project_id: str, workspace: str = ""):
+    workspace = workspace or _get_active_workspace()
+    try:
+        return await asyncio.to_thread(
+            film_api_service.assembly_report,
+            _film_save_root(),
+            workspace,
+            project_id,
+            engine_available=film_api_service.engine_status()["generation_possible"],
+            uploads_root=_film_uploads_root(),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects/{project_id}/assembly")
+async def film_assemble(project_id: str, request: Request):
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    try:
+        return await asyncio.to_thread(
+            film_api_service.assemble_project,
+            _film_save_root(),
+            workspace,
+            project_id,
+            include_subtitles=bool(body.get("include_subtitles")),
+            include_titles=bool(body.get("include_titles", True)),
+            title_text=str(body.get("title_text") or ""),
+            credits_text=str(body.get("credits_text") or ""),
+            only_approved=bool(body.get("only_approved")),
+            width=int(body["width"]) if body.get("width") else None,
+            height=int(body["height"]) if body.get("height") else None,
+            fps=float(body["fps"]) if body.get("fps") else None,
+            uploads_root=_film_uploads_root(),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/film/projects/{project_id}/export")
+async def film_export(project_id: str, request: Request):
+    """Render the assembled cut through the Editor's FFmpeg pipeline.
+
+    ``assemble: true`` (the default) refreshes the Editor project from the
+    current storyboard first, so the export always matches what the user sees.
+    """
+    body = await request.json()
+    workspace = body.get("workspace") or _get_active_workspace()
+    try:
+        editor_project = None
+        if bool(body.get("assemble", True)):
+            assembled = await asyncio.to_thread(
+                film_api_service.assemble_project,
+                _film_save_root(),
+                workspace,
+                project_id,
+                include_subtitles=bool(body.get("include_subtitles")),
+                include_titles=bool(body.get("include_titles", True)),
+                title_text=str(body.get("title_text") or ""),
+                credits_text=str(body.get("credits_text") or ""),
+                only_approved=bool(body.get("only_approved")),
+                uploads_root=_film_uploads_root(),
+            )
+            editor_project = assembled["editor_project"]
+        project = film_api_service.get_project(_film_save_root(), workspace, project_id)
+        editor_project_id = str((project.get("timeline") or {}).get("editor_project_id") or "")
+        if editor_project is None:
+            if not editor_project_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Assemble the production before exporting it.",
+                )
+            editor_project = load_editor_project(_film_save_root(), workspace, editor_project_id)
+        queue_mode = str(body.get("queue_mode") or "now").lower()
+        if queue_mode not in {"now", "held"}:
+            raise HTTPException(status_code=400, detail="queue_mode must be 'now' or 'held'")
+        queued = _queue_editor_export(editor_project, workspace, queue_mode == "held")
+        saved = film_api_service.record_export(
+            _film_save_root(),
+            workspace,
+            project_id,
+            job_id=queued["job_id"],
+            status=queued["status"],
+            settings={
+                "queue_mode": queue_mode,
+                "width": editor_project["canvas"]["width"],
+                "height": editor_project["canvas"]["height"],
+                "fps": editor_project["canvas"]["fps"],
+                "resolution": editor_project["export"].get("resolution", "canvas"),
+                "frame_rate": editor_project["export"].get("frame_rate", "project"),
+                "codec": editor_project["export"].get("codec", "h264"),
+            },
+        )
+        return {
+            "job_id": queued["job_id"],
+            "status": queued["status"],
+            "editor_project_id": editor_project_id,
+            "project": saved,
+            "engine": film_api_service.engine_status(),
+        }
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+# ============================================================================
+# Engine registry and compute nodes
+# ============================================================================
+# Thin HTTP shell over services.engine_providers and services.compute_nodes.
+# The studio resolves *capabilities*; it never addresses an inference engine
+# directly, and a capability is only ever advertised from measured state.
+
+_FILM_VOICE_MODEL_RE = re.compile(r"tts|voice|speech|speak|chatterbox|index", re.IGNORECASE)
+
+
+def _film_compute_nodes_root() -> str:
+    return os.path.join(_app_dir, "settings", "compute_nodes")
+
+
+def _remote_peers_root() -> str:
+    """Where this machine remembers the Maestros it can delegate generation to.
+
+    Its own directory (gitignored) because the file holds a peer token.
+    """
+    return os.path.join(_app_dir, "settings", "remote_peers")
+
+
+def _film_upload_sessions_root() -> str:
+    return os.path.join(_editor_uploads_root(), ".sessions")
+
+
+def _film_local_engine_capabilities() -> dict:
+    """Capabilities this install can perform, with the evidence for each one.
+
+    Nothing is asserted from a model's name alone: a generation capability is
+    reported only when the install exposes a model definition declaring the
+    matching class, and the model type that justified it is returned alongside,
+    so the UI can show *why* it believes the machine can do it.
+    """
+    status = film_api_service.engine_status()
+    capabilities: list[str] = []
+    evidence: dict[str, list[str]] = {}
+
+    def add(capability: str, why: str) -> None:
+        if capability not in capabilities:
+            capabilities.append(capability)
+        bucket = evidence.setdefault(capability, [])
+        if why not in bucket:
+            bucket.append(why)
+
+    if status.get("ffmpeg") or status.get("ffprobe"):
+        # Real work the studio does locally without any model: assembly,
+        # scaling (``scale``) and retiming (``minterpolate``).
+        add("auxiliary_processing", "ffmpeg")
+        add("upscaling", "ffmpeg")
+        add("frame_interpolation", "ffmpeg")
+    try:
+        import faster_whisper  # noqa: F401  (optional local runtime dependency)
+
+        add("transcription", "faster_whisper")
+    except Exception:
+        pass
+
+    model_types = list(getattr(wgp, "displayed_model_types", []) or [])
+    for model_type in model_types:
+        model_def = wgp.get_model_def(model_type) or {}
+        try:
+            image_mode = int(model_def.get("image_mode") or 0)
+        except (TypeError, ValueError):
+            image_mode = 0
+        if model_def.get("t2v_class"):
+            add("text_to_video", model_type)
+        if model_def.get("i2v_class"):
+            add("image_to_video", model_type)
+        if model_def.get("vace_class"):
+            # VACE is the edit/reference-video class in this repository.
+            add("video_to_video", model_type)
+        if image_mode == 1:
+            add("image_generation", model_type)
+        elif image_mode == 2:
+            add("inpainting", model_type)
+        if model_def.get("audio_only"):
+            add("audio_generation", model_type)
+            if _FILM_VOICE_MODEL_RE.search(str(model_def.get("name") or model_type)):
+                add("voice_generation", model_type)
+
+    return {
+        "capabilities": capabilities,
+        "evidence": evidence,
+        "models": model_types,
+        "generation_possible": bool(status.get("generation_possible")),
+        "tools": status,
+    }
+
+
+def _film_engine_registry():
+    """Compose the engine registry from what is registered and reachable now.
+
+    A node whose kind is ``comfyui`` contributes its ComfyUI server (address =
+    base URL); every other node contributes a remote compute provider, and so does
+    every configured peer Maestro (``services.remote_engine``), whose capabilities
+    were declared by the user or measured from that peer's own report.  The local
+    engine is always present, even with no capability at all.
+    """
+    from services import compute_nodes as compute_nodes_service
+    from services import engine_providers as engine_providers_service
+
+    local = _film_local_engine_capabilities()
+    nodes = compute_nodes_service.list_nodes(_film_compute_nodes_root())
+    comfy_servers = []
+    plain_nodes = []
+    reachable = {"local"}
+    # A peer and a compute node must not claim the same provider id: the queue
+    # routes by ``node:<id>``, so a collision would make a job ambiguous.
+    occupied = {str(node["node_id"]) for node in nodes}
+    for peer in remote_engine_service.provider_entries(_remote_peers_root()):
+        peer_id = str(peer["node_id"])
+        if peer_id in occupied:
+            print(
+                f"[Engines] Peer {peer_id!r} shares its id with a compute node; "
+                "the compute node owns that id."
+            )
+            continue
+        if peer["online"]:
+            reachable.add(peer_id)
+        plain_nodes.append(peer)
+    for node in nodes:
+        if node["online"]:
+            reachable.add(str(node["node_id"]))
+        if node["kind"] == "comfyui" and node["address"]:
+            comfy_servers.append({
+                "base_url": node["address"],
+                "label": node["label"],
+                "capabilities": node["capabilities"],
+                "models": node["models"],
+                "node_id": node["node_id"],
+                "online": node["online"],
+                "notes": "ComfyUI server registered as a compute node.",
+            })
+        else:
+            plain_nodes.append(node)
+    registry = engine_providers_service.build_registry(
+        local_capabilities=local["capabilities"],
+        local_models=local["models"] if local["capabilities"] else [],
+        local_detail={
+            "generation_possible": local["generation_possible"],
+            "tools": local["tools"],
+            "capability_evidence": local["evidence"],
+        },
+        comfy_servers=comfy_servers,
+        nodes=plain_nodes,
+    )
+    return registry, local, reachable
+
+
+@film_api_service.register_generation_source
+def _film_remote_generation_sources() -> list[dict]:
+    """Remote Maestros that answered recently and can render something.
+
+    Registered at import time, before any request, so the Films workspace reports
+    generation as possible on a computer that has no GPU of its own — and names the
+    computer that will do the work.
+    """
+    return remote_engine_service.generation_sources(_remote_peers_root())
+
+
+@api.get("/api/v1/engines")
+def engines_status():
+    """Which capabilities are available here, by whom, and why."""
+    try:
+        registry, local, reachable = _film_engine_registry()
+        status = registry.status(node_ids=sorted(reachable))
+        status["local_engine"] = {
+            "capabilities": local["capabilities"],
+            "evidence": local["evidence"],
+            "generation_possible": local["generation_possible"],
+            "tools": local["tools"],
+        }
+        status["compute"] = compute_nodes_service.summary(_film_compute_nodes_root())
+        return status
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.get("/api/v1/engines/capabilities")
+def engines_capabilities():
+    from services.engine_providers import describe_capabilities, PROVIDER_KINDS
+
+    return {"capabilities": describe_capabilities(), "provider_kinds": list(PROVIDER_KINDS)}
+
+
+@api.get("/api/v1/compute/nodes")
+def compute_nodes_list(offline_after: float = 0.0):
+    try:
+        kwargs = {"offline_after": float(offline_after)} if offline_after else {}
+        return {
+            "nodes": compute_nodes_service.list_nodes(_film_compute_nodes_root(), **kwargs),
+            "summary": compute_nodes_service.summary(_film_compute_nodes_root()),
+        }
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/compute/nodes")
+async def compute_node_register(request: Request):
+    """Register a node.  The token is returned **once**; only its hash is kept."""
+    body = await request.json()
+    try:
+        return compute_nodes_service.register_node(_film_compute_nodes_root(), body)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.get("/api/v1/compute/nodes/{node_id}")
+def compute_node_get(node_id: str):
+    try:
+        return compute_nodes_service.get_node(_film_compute_nodes_root(), node_id)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.patch("/api/v1/compute/nodes/{node_id}")
+async def compute_node_update(node_id: str, request: Request):
+    body = await request.json()
+    try:
+        return compute_nodes_service.update_node(_film_compute_nodes_root(), node_id, body)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.delete("/api/v1/compute/nodes/{node_id}")
+def compute_node_remove(node_id: str):
+    try:
+        return compute_nodes_service.remove_node(_film_compute_nodes_root(), node_id)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/compute/nodes/{node_id}/heartbeat")
+async def compute_node_heartbeat(node_id: str, request: Request):
+    body = await request.json()
+    token = str(body.get("token") or "")
+    if not token:
+        raise HTTPException(status_code=401, detail="A node token is required")
+    try:
+        return compute_nodes_service.heartbeat(
+            _film_compute_nodes_root(), node_id, token, stats=body.get("stats"))
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/compute/nodes/{node_id}/recover")
+def compute_node_recover(node_id: str):
+    """Hand back the work that was parked while this node was unreachable."""
+    try:
+        return compute_nodes_service.recover_node(_film_compute_nodes_root(), node_id)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.get("/api/v1/compute/assignments")
+def compute_assignments():
+    root = _film_compute_nodes_root()
+    try:
+        return {
+            "summary": compute_nodes_service.summary(root),
+            "parked": compute_nodes_service.orphaned_jobs(root),
+        }
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/compute/assignments")
+async def compute_assign(request: Request):
+    body = await request.json()
+    try:
+        return compute_nodes_service.assign_job(
+            _film_compute_nodes_root(),
+            str(body.get("job_id") or ""),
+            str(body.get("node_id") or ""),
+            capability=str(body.get("capability") or ""),
+            task=str(body.get("task") or ""),
+            params=body.get("params") if isinstance(body.get("params"), dict) else None,
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/compute/assignments/{job_id}/release")
+async def compute_assignment_release(job_id: str, request: Request):
+    body = await request.json()
+    try:
+        return compute_nodes_service.release_job(
+            _film_compute_nodes_root(),
+            job_id,
+            outcome=str(body.get("outcome") or "completed"),
+            error=str(body.get("error") or ""),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/engines/comfyui/probe")
+async def comfyui_probe(request: Request):
+    """Probe a ComfyUI server and report only what it can really do."""
+    from services import comfyui_adapter
+
+    body = await request.json()
+    base_url = str(body.get("base_url") or "").strip()
+    try:
+        return await asyncio.to_thread(
+            comfyui_adapter.probe_server,
+            base_url,
+            templates_dir=comfyui_adapter.default_templates_dir(),
+            timeout=float(body.get("timeout") or comfyui_adapter.DEFAULT_TIMEOUT),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.get("/api/v1/engines/comfyui/templates")
+def comfyui_templates():
+    from services import comfyui_adapter
+
+    templates_dir = comfyui_adapter.default_templates_dir()
+    return {
+        "templates_dir": templates_dir,
+        "templates": [t.describe() for t in comfyui_adapter.list_templates(templates_dir)],
+    }
+
+
+@api.post("/api/v1/engines/comfyui/run")
+async def comfyui_run(request: Request):
+    """Submit one versioned workflow template to a ComfyUI server."""
+    from services import comfyui_adapter
+
+    body = await request.json()
+    try:
+        adapter = comfyui_adapter.ComfyUIAdapter(
+            str(body.get("base_url") or ""),
+            templates_dir=comfyui_adapter.default_templates_dir(),
+            timeout=float(body.get("timeout") or comfyui_adapter.DEFAULT_TIMEOUT),
+        )
+        params = body.get("params") if isinstance(body.get("params"), dict) else {}
+        return await asyncio.to_thread(
+            adapter.submit, str(body.get("template_id") or ""), params)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.get("/api/v1/engines/comfyui/run/{prompt_id}")
+async def comfyui_run_status(prompt_id: str, base_url: str, timeout: float = 0.0):
+    from services import comfyui_adapter
+
+    try:
+        adapter = comfyui_adapter.ComfyUIAdapter(
+            base_url,
+            templates_dir=comfyui_adapter.default_templates_dir(),
+            timeout=timeout or comfyui_adapter.DEFAULT_TIMEOUT,
+        )
+        progress = await asyncio.to_thread(adapter.progress, prompt_id)
+        if progress.get("state") == "completed":
+            results = await asyncio.to_thread(adapter.results, prompt_id)
+            return {**progress, "results": results}
+        return progress
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/engines/comfyui/run/{prompt_id}/cancel")
+async def comfyui_run_cancel(prompt_id: str, request: Request):
+    from services import comfyui_adapter
+
+    body = await request.json()
+    try:
+        adapter = comfyui_adapter.ComfyUIAdapter(
+            str(body.get("base_url") or ""),
+            templates_dir=comfyui_adapter.default_templates_dir(),
+            timeout=float(body.get("timeout") or comfyui_adapter.DEFAULT_TIMEOUT),
+        )
+        return await asyncio.to_thread(adapter.cancel, prompt_id)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+# ============================================================================
+# Reference URL import and chunked uploads
+# ============================================================================
+# services.reference_urls refuses private/loopback/metadata targets and never
+# bypasses a platform's access controls; services.upload_chunks keeps large
+# media out of RAM by assembling it chunk by chunk on disk.
+
+_FILM_REFERENCE_MAX_BYTES = 512 * 1024 * 1024
+
+
+@api.post("/api/v1/reference/url/validate")
+async def reference_url_validate(request: Request):
+    """Check a URL's shape and target without making any request."""
+    from services import reference_urls
+
+    body = await request.json()
+    try:
+        checked = reference_urls.validate_reference_url(
+            str(body.get("url") or ""),
+            allow_private=bool(body.get("allow_private")),
+        )
+        return {**checked, "importable": True}
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/reference/url/import")
+async def reference_url_import(request: Request):
+    """Download a reference file, and optionally attach it to a production.
+
+    The file lands in the workspace uploads directory.  When ``project_id`` is
+    given it is registered as a project asset with the requested creative role,
+    so the same file is never fetched twice for the same production.
+    """
+    from services import reference_urls
+
+    body = await request.json()
+    url = str(body.get("url") or "")
+    workspace = str(body.get("workspace") or "") or _get_active_workspace()
+    uploads_root = _film_uploads_root()
+    try:
+        fetched = await asyncio.to_thread(
+            reference_urls.fetch_reference_url,
+            url,
+            dest_dir=uploads_root,
+            max_bytes=int(body.get("max_bytes") or _FILM_REFERENCE_MAX_BYTES),
+            timeout=float(body.get("timeout") or reference_urls.DEFAULT_TIMEOUT),
+            allow_private=bool(body.get("allow_private")),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+    project_id = str(body.get("project_id") or "").strip()
+    if not project_id:
+        return {"reference": fetched, "asset": None}
+
+    role = str(body.get("role") or "").strip()
+    entry = {
+        "filename": fetched["stored_name"],
+        "path": fetched["path"],
+        "name": str(body.get("name") or fetched["filename"]),
+    }
+    if role:
+        entry["role"] = role
+    try:
+        imported = await asyncio.to_thread(
+            film_api_service.import_assets,
+            _film_save_root(),
+            workspace,
+            project_id,
+            [entry],
+            analyze=bool(body.get("analyze")),
+            uploads_root=uploads_root,
+        )
+    except Exception as error:
+        # The download succeeded; only the attachment failed. Report both so the
+        # caller can attach it manually instead of losing the file.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Downloaded {fetched['stored_name']} but could not attach it: {error}"
+            ),
+        ) from error
+    return {"reference": fetched, "asset": imported}
+
+
+@api.get("/api/v1/uploads/limits")
+def upload_limits():
+    from services import upload_chunks
+
+    return {
+        "limits": upload_chunks.kind_limits(),
+        "chunk_size": upload_chunks.DEFAULT_CHUNK_SIZE,
+        "min_chunk_size": 64 * 1024,
+        "max_chunk_size": 256 * 1024 * 1024,
+        "reserve_bytes": upload_chunks.MIN_FREE_RESERVE,
+        "note": ("Limits are per media kind and configurable; see docs/FILM-STUDIO.md "
+                 "for how to raise them."),
+    }
+
+
+@api.post("/api/v1/uploads/sessions")
+async def upload_session_create(request: Request):
+    """Open a resumable upload session for a large reference file."""
+    from services import upload_chunks
+
+    body = await request.json()
+    try:
+        return await asyncio.to_thread(
+            upload_chunks.init_session,
+            _film_upload_sessions_root(),
+            filename=str(body.get("filename") or ""),
+            total_bytes=int(body.get("total_bytes") or 0),
+            content_type=str(body.get("content_type") or ""),
+            expected_sha256=str(body.get("sha256") or ""),
+            chunk_size=int(body.get("chunk_size") or upload_chunks.DEFAULT_CHUNK_SIZE),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.get("/api/v1/uploads/sessions/{session_id}")
+def upload_session_status(session_id: str):
+    """What arrived and what is missing — the resume contract."""
+    from services import upload_chunks
+
+    try:
+        return upload_chunks.session_status(_film_upload_sessions_root(), session_id)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+async def _read_bounded_chunk(request: Request, limit: int) -> bytes:
+    """Read a request body without ever buffering more than ``limit`` bytes."""
+    parts: list[bytes] = []
+    total = 0
+    async for part in request.stream():
+        total += len(part)
+        if total > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Chunk exceeds the {limit} byte limit for this session",
+            )
+        parts.append(part)
+    return b"".join(parts)
+
+
+@api.post("/api/v1/uploads/sessions/{session_id}/chunks")
+async def upload_session_chunk(session_id: str, request: Request, index: int = 0,
+                               sha256: str = ""):
+    """Store one chunk.  The body is capped at the session's chunk size."""
+    from services import upload_chunks
+
+    root = _film_upload_sessions_root()
+    try:
+        state = upload_chunks.session_status(root, session_id)
+    except Exception as error:
+        raise _film_http_error(error) from error
+    limit = int(state.get("chunk_size") or upload_chunks.DEFAULT_CHUNK_SIZE)
+    data = await _read_bounded_chunk(request, limit)
+    try:
+        return await asyncio.to_thread(
+            upload_chunks.append_chunk, root, session_id, index, data,
+            chunk_sha256=sha256)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/uploads/sessions/{session_id}/complete")
+async def upload_session_complete(session_id: str, request: Request):
+    """Assemble the chunks into the uploads directory, streaming."""
+    from services import upload_chunks
+
+    body = await request.json() if await request.body() else {}
+    try:
+        return await asyncio.to_thread(
+            upload_chunks.complete_session,
+            _film_upload_sessions_root(),
+            session_id,
+            final_dir=_film_uploads_root(),
+            dedup=bool(body.get("dedup", True)),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.delete("/api/v1/uploads/sessions/{session_id}")
+def upload_session_cancel(session_id: str, keep_record: bool = True):
+    from services import upload_chunks
+
+    try:
+        return upload_chunks.cancel_session(
+            _film_upload_sessions_root(), session_id, keep_record=keep_record)
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+@api.post("/api/v1/uploads/sessions/cleanup")
+async def upload_sessions_cleanup(request: Request):
+    """Delete finished sessions, and stale ones only when asked."""
+    from services import upload_chunks
+
+    body = await request.json() if await request.body() else {}
+    try:
+        return await asyncio.to_thread(
+            upload_chunks.cleanup_sessions,
+            _film_upload_sessions_root(),
+            older_than=float(body.get("older_than") or upload_chunks.STALE_AFTER_SECONDS),
+            include_open=bool(body.get("include_open", False)),
+        )
+    except Exception as error:
+        raise _film_http_error(error) from error
+
+
+# ============================================================================
+# Production queue (persistent jobs, spec §10)
+# ============================================================================
+# The queue itself lives in services.generation_queue (states, priorities,
+# retries, cancellation, recovery) and is executed by services.queue_worker,
+# which runs a claimed job through a handler registered for its engine.  The
+# HTTP shell is services.production_queue_api -- a router factory, so the whole
+# queue API can be driven over HTTP in tests without booting the application.
+
+
+def _film_queue_root() -> str:
+    return os.path.join(_app_dir, "settings", "generation_queue")
+
+
+def _recover_generation_queue_on_start(_app=None):
+    """Recover interrupted work when the backend starts (spec §10).
+
+    The worker is deliberately *not* started here: running an engine is an
+    explicit action, and a silent generation thread at boot is not something a
+    user asked for.  ``POST /api/v1/production/queue/worker/start`` does that.
+    """
+    production_queue_api.recover_on_start(_film_queue_root())
+
+
+api.add_event_handler("startup", _recover_generation_queue_on_start)
+api.include_router(production_queue_api.create_router(root_provider=_film_queue_root))
+
+
+# ============================================================================
+# Local engine: measured hardware, self-hosted ComfyUI, first real clip
+# ============================================================================
+# The default and only generation path is a local, free engine: services.
+# local_engine_api measures this computer, plans the ComfyUI install and proves
+# it with a real clip; services.comfy_jobs runs queued generations on it.  No
+# commercial provider and no credit balance is involved anywhere in this path.
+
+
+def _local_engine_out_dir() -> str:
+    """Where produced clips land: the active workspace, which /api/v1/file serves."""
+    return _workspace_dir()
+
+
+def _local_engine_comfy_address(node_id: str) -> str:
+    """The address of a registered ComfyUI node, for jobs that name a node."""
+    try:
+        node = compute_nodes_service.get_node(_film_compute_nodes_root(), str(node_id))
+    except Exception:
+        return ""
+    return str(node.get("address") or "")
+
+
+def _register_local_comfyui_runner(_app=None):
+    """Route queued work to the local ComfyUI engine.
+
+    Registered for the bare engine name and for every registered ComfyUI node's
+    own id, so a job may name either ``comfyui`` or one specific server.  This only
+    decides *routing*: it generates nothing by itself, and if no ComfyUI answers, the
+    jobs wait in the queue instead of failing.
+    """
+    engines = [comfy_jobs_service.ENGINE]
+    try:
+        for node in compute_nodes_service.list_nodes(_film_compute_nodes_root()):
+            if node.get("kind") == "comfyui" and node.get("address"):
+                engines.append(f"comfyui:{node['address']}")
+    except Exception as error:
+        print(f"[ComfyUI] Could not list registered nodes: {error}")
+    try:
+        registered = comfy_jobs_service.register_comfyui_handler(
+            engines=tuple(dict.fromkeys(engines)),
+            out_dir=_local_engine_out_dir(),
+            node_resolver=_local_engine_comfy_address,
+        )
+        print(f"[ComfyUI] Queue runner registered for: {', '.join(registered)}")
+    except Exception as error:
+        print(f"[ComfyUI] Could not register the queue runner: {error}")
+
+
+api.add_event_handler("startup", _register_local_comfyui_runner)
+api.include_router(
+    local_engine_api_service.create_router(
+        queue_root=_film_queue_root(),
+        compute_nodes_root=_film_compute_nodes_root(),
+        out_dir=_local_engine_out_dir,
+        file_url=lambda path: local_engine_api_service.make_file_url(path, _get_active_workspace()),
+    )
+)
+
+
+# ============================================================================
+# Remote engine: a peer Maestro with the GPU renders what is queued here
+# ============================================================================
+# This is the path for a modest computer (no NVIDIA GPU).  The interface, the
+# projects, the storyboard and the durable queue stay on this machine; the render
+# is delegated to another Maestro over the private network the user already has
+# (LAN or Tailscale), through that peer's **own** queue API and authenticated with
+# its bearer token.  services.remote_engine owns the logic; these routes only
+# translate JSON.  Nothing here opens a port, publishes a tunnel or generates.
+
+
+def _remote_http_error(error: Exception) -> HTTPException:
+    """Errors of this surface keep their own message.
+
+    A peer that is not configured is a 404 and a rejected description is a 400;
+    both are things the caller can act on, so neither is flattened into a generic
+    production error.
+    """
+    if isinstance(error, FileNotFoundError):
+        return HTTPException(status_code=404, detail=str(error))
+    if isinstance(error, remote_engine_service.RemoteEngineError):
+        return HTTPException(status_code=400, detail=str(error))
+    return _film_http_error(error)
+
+
+def _register_remote_engine_runner(_app=None):
+    """Route ``node:<peer_id>`` jobs to the peer that owns them.
+
+    Registered for every configured peer, so a job may name the peer directly.  If
+    no peer is configured, no engine is registered and queued work reports "no
+    runner" instead of being silently dropped.
+    """
+    try:
+        root = _remote_peers_root()
+        engines = remote_engine_service.engines_for_peers(root)
+        if not engines:
+            return
+        registered = remote_engine_service.register_remote_handlers(
+            peers_root=root, out_dir=_local_engine_out_dir()
+        )
+        print(f"[Remote engine] Queue runner registered for: {', '.join(registered)}")
+    except Exception as error:
+        print(f"[Remote engine] Could not register the queue runner: {error}")
+
+
+api.add_event_handler("startup", _register_remote_engine_runner)
+
+
+@api.get("/api/v1/engines/remote/peers")
+def remote_peers_list():
+    """The configured peers, their measured state, and what routes to them."""
+    try:
+        root = _remote_peers_root()
+        return {
+            "peers": remote_engine_service.list_peers(root),
+            "engines": remote_engine_service.engines_for_peers(root),
+            "generation_sources": remote_engine_service.generation_sources(root),
+            "policy": {
+                "kind": "remote_maestro",
+                "protocol": "The peer's own /api/v1/production/queue, over HTTP with a token.",
+                "token": "MAESTRO_ACCESS_TOKEN on the peer, sent as a Bearer header.",
+                "note": (
+                    "A peer is reported online only while a probe answered recently; its "
+                    "capabilities are declared by you or measured from that peer's own report. "
+                    "Tokens are stored on this computer and are never returned by this API."
+                ),
+            },
+        }
+    except Exception as error:
+        raise _remote_http_error(error) from error
+
+
+@api.post("/api/v1/engines/remote/peers")
+async def remote_peers_add(request: Request):
+    """Register a peer Maestro, route its engine to it, and probe it once."""
+    body = await request.json()
+    try:
+        root = _remote_peers_root()
+        record = remote_engine_service.add_peer(root, body)
+        registered = remote_engine_service.register_remote_handlers(
+            peers_root=root, out_dir=_local_engine_out_dir(), engines=(record["engine_id"],)
+        )
+        probe = await asyncio.to_thread(
+            remote_engine_service.probe_peer,
+            root,
+            record["peer_id"],
+            timeout=float(body.get("timeout") or remote_engine_service.DEFAULT_TIMEOUT),
+        )
+        return {
+            "peer": probe.get("peer") or record,
+            "probe": probe.get("probe"),
+            "online": bool(probe.get("online")),
+            "engines": remote_engine_service.engines_for_peers(root),
+            "registered": registered,
+            "next_step": (
+                "Jobs whose engine is that peer's id are sent to that computer. Start this "
+                "machine's queue worker (POST /api/v1/production/queue/worker/start) so it "
+                "can hand them over."
+            ),
+        }
+    except Exception as error:
+        raise _remote_http_error(error) from error
+
+
+@api.patch("/api/v1/engines/remote/peers/{peer_id}")
+async def remote_peers_update(peer_id: str, request: Request):
+    body = await request.json()
+    try:
+        root = _remote_peers_root()
+        updated = remote_engine_service.update_peer(root, peer_id, body)
+        remote_engine_service.register_remote_handlers(
+            peers_root=root, out_dir=_local_engine_out_dir(), engines=(updated["engine_id"],)
+        )
+        return {"peer": updated, "engines": remote_engine_service.engines_for_peers(root)}
+    except Exception as error:
+        raise _remote_http_error(error) from error
+
+
+@api.delete("/api/v1/engines/remote/peers/{peer_id}")
+def remote_peers_remove(peer_id: str):
+    """Forget a peer here.  Nothing is changed on that computer."""
+    try:
+        root = _remote_peers_root()
+        result = remote_engine_service.remove_peer(root, peer_id)
+        remote_engine_service.unregister_remote_handlers(
+            (f"{remote_engine_service.ENGINE_PREFIX}:{peer_id}",)
+        )
+        return {**result, "engines": remote_engine_service.engines_for_peers(root)}
+    except Exception as error:
+        raise _remote_http_error(error) from error
+
+
+@api.post("/api/v1/engines/remote/peers/{peer_id}/probe")
+async def remote_peers_probe(peer_id: str, request: Request):
+    """Ask a peer what it can do right now; reachability is measured, not assumed."""
+    body = await request.json() if await request.body() else {}
+    try:
+        return await asyncio.to_thread(
+            remote_engine_service.probe_peer,
+            _remote_peers_root(),
+            peer_id,
+            timeout=float(body.get("timeout") or remote_engine_service.DEFAULT_TIMEOUT),
+        )
+    except Exception as error:
+        raise _remote_http_error(error) from error
+
+
+@api.post("/api/v1/engines/remote/queue-job")
+async def remote_engine_queue_job(request: Request):
+    """Queue a job for a peer Maestro, in this machine's durable queue.
+
+    The job is stored here and handed to the peer by the queue worker, so a peer
+    that is switched off defers it instead of losing it.
+    """
+    from services import generation_queue as generation_queue_service
+    from services import queue_worker as queue_worker_service
+
+    body = await request.json()
+    try:
+        root = _remote_peers_root()
+        peer = remote_engine_service.get_peer(root, str(body.get("peer_id") or ""))
+        peer_id = str(peer["peer_id"])
+        capability = str(body.get("capability") or "").strip()
+        declared = [str(item) for item in (peer.get("capabilities") or [])]
+        if capability and capability not in declared:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Peer {peer_id!r} has not reported {capability!r}. It reports: "
+                    + (", ".join(declared) or "nothing yet — probe it first")
+                ),
+            )
+        params = body.get("params") if isinstance(body.get("params"), dict) else {}
+        engine_id = f"{remote_engine_service.ENGINE_PREFIX}:{peer_id}"
+        submitted = generation_queue_service.submit(
+            _film_queue_root(),
+            {
+                "project_id": str(body.get("project_id") or ""),
+                "scene_id": str(body.get("scene_id") or ""),
+                "shot_id": str(body.get("shot_id") or ""),
+                "task": str(body.get("task") or "video"),
+                "engine": engine_id,
+                "model": str(body.get("model") or ""),
+                "params": {
+                    **params,
+                    "peer_id": peer_id,
+                    **({"capability": capability} if capability else {}),
+                },
+                "inputs": list(body.get("inputs") or []),
+                "priority": int(body.get("priority") or 0),
+                "memory_mb": int(body.get("memory_mb") or 0),
+                "dedupe_key": str(body.get("dedupe_key") or ""),
+                "cancel_supported": True,
+            },
+        )
+        return {
+            **submitted,
+            "engine": engine_id,
+            "queue_worker_running": bool(queue_worker_service.worker_status().get("running")),
+            "note": (
+                f"The job is queued here and will be sent to {peer['label']} "
+                f"({peer['base_url']}) by this machine's queue worker. If that computer is "
+                "off, the job waits instead of failing."
+            ),
+        }
+    except Exception as error:
+        raise _remote_http_error(error) from error
 
 
 # ============================================================================
@@ -30229,10 +31766,11 @@ _mimetypes.add_type("text/javascript", ".mjs")
 _mimetypes.add_type("text/css", ".css")
 _mimetypes.add_type("image/svg+xml", ".svg")
 
-# Keep the installable web-app icon sourced from Maestro's canonical tracked
-# artwork instead of maintaining a second binary copy under ui/public. This
-# route is registered before the root StaticFiles mount so the manifest and
-# iOS apple-touch-icon link can both use the same stable URL.
+# Keep the favicon sourced from Maestro's canonical tracked artwork instead of
+# maintaining a second binary copy under ui/public. This route is registered
+# before the root StaticFiles mount so /maestro-icon.png stays a stable URL; the
+# manifest icons and the iOS Home Screen icon are the generated PNGs in
+# ui/public (see scripts/generate_pwa_icons.py).
 _maestro_web_icon = os.path.normpath(
     os.path.join(_app_dir, "..", "maestro_simplified_icon_alpha.png")
 )

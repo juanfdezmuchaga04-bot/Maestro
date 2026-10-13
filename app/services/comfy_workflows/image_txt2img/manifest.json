@@ -1,0 +1,25 @@
+{
+  "template_id": "image_txt2img",
+  "version": "1",
+  "label": "Text to image (SD/SDXL checkpoint)",
+  "capabilities": ["image_generation"],
+  "inputs": {
+    "prompt": { "node": "6", "field": "text", "required": true, "type": "string" },
+    "negative_prompt": { "node": "7", "field": "text", "default": "", "type": "string" },
+    "ckpt_name": { "node": "4", "field": "ckpt_name", "required": true, "type": "string" },
+    "seed": { "node": "3", "field": "seed", "default": 0, "type": "integer" },
+    "steps": { "node": "3", "field": "steps", "default": 20, "type": "integer" },
+    "cfg": { "node": "3", "field": "cfg", "default": 7.0, "type": "number" },
+    "sampler_name": { "node": "3", "field": "sampler_name", "default": "euler", "type": "string" },
+    "scheduler": { "node": "3", "field": "scheduler", "default": "normal", "type": "string" },
+    "denoise": { "node": "3", "field": "denoise", "default": 1.0, "type": "number" },
+    "width": { "node": "5", "field": "width", "default": 1024, "type": "integer" },
+    "height": { "node": "5", "field": "height", "default": 1024, "type": "integer" },
+    "batch_size": { "node": "5", "field": "batch_size", "default": 1, "type": "integer" },
+    "filename_prefix": { "node": "9", "field": "filename_prefix", "default": "maestro", "type": "string" }
+  },
+  "outputs": {
+    "images": { "node": "9", "kind": "image" }
+  },
+  "notes": "The canonical ComfyUI text-to-image graph (API format). Works with whatever checkpoints the connected server exposes; pass ckpt_name from the server's CheckpointLoaderSimple list."
+}

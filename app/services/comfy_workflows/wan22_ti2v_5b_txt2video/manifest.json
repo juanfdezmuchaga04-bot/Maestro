@@ -1,0 +1,32 @@
+{
+  "template_id": "wan22_ti2v_5b_txt2video",
+  "version": "1",
+  "label": "Wan 2.2 TI2V-5B — text to video (local, Apache-2.0)",
+  "capabilities": ["text_to_video"],
+  "model": "wan22_ti2v_5b",
+  "inputs": {
+    "prompt": { "node": "5", "field": "text", "required": true, "type": "string" },
+    "negative_prompt": { "node": "6", "field": "text", "default": "", "type": "string" },
+    "unet_name": { "node": "1", "field": "unet_name", "required": true, "type": "string" },
+    "clip_name": { "node": "2", "field": "clip_name", "required": true, "type": "string" },
+    "clip_type": { "node": "2", "field": "type", "default": "wan", "type": "string" },
+    "vae_name": { "node": "3", "field": "vae_name", "required": true, "type": "string" },
+    "shift": { "node": "4", "field": "shift", "default": 8.0, "type": "number" },
+    "seed": { "node": "8", "field": "seed", "default": 0, "type": "integer" },
+    "steps": { "node": "8", "field": "steps", "default": 20, "type": "integer" },
+    "cfg": { "node": "8", "field": "cfg", "default": 5.0, "type": "number" },
+    "sampler_name": { "node": "8", "field": "sampler_name", "default": "uni_pc", "type": "string" },
+    "scheduler": { "node": "8", "field": "scheduler", "default": "simple", "type": "string" },
+    "denoise": { "node": "8", "field": "denoise", "default": 1.0, "type": "number" },
+    "width": { "node": "7", "field": "width", "default": 1280, "type": "integer" },
+    "height": { "node": "7", "field": "height", "default": 704, "type": "integer" },
+    "length": { "node": "7", "field": "length", "default": 121, "type": "integer" },
+    "batch_size": { "node": "7", "field": "batch_size", "default": 1, "type": "integer" },
+    "fps": { "node": "10", "field": "fps", "default": 24, "type": "integer" },
+    "filename_prefix": { "node": "11", "field": "filename_prefix", "default": "maestro", "type": "string" }
+  },
+  "outputs": {
+    "video": { "node": "11", "kind": "video" }
+  },
+  "notes": "Derived from the official ComfyUI Wan 2.2 5B example (UNETLoader / CLIPLoader / VAELoader / ModelSamplingSD3 / CLIPTextEncode x2 / Wan22ImageToVideoLatent / KSampler / VAEDecode) with the current core video nodes CreateVideo -> SaveVideo (mp4). Defaults: 1280x704, 121 frames, 24 fps. NOT executed against a live ComfyUI by the repository authors: the adapter checks every class_type against the connected server's /object_info before use, ComfyUI rejects unknown inputs loudly with node_errors, and the setup screen's functional test is what proves the engine end to end. Override sampler_name / scheduler / clip_type / width / height / length here or from the API if your ComfyUI build prefers other values; all of them are declared inputs precisely so they can be changed without editing the graph."
+}

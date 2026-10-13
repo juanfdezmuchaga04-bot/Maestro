@@ -1,5 +1,6 @@
 // Wipes every install artifact so the next Install starts from scratch.
-// Mirrors the directories created by install.js and sam_install.js.
+// Mirrors the directories created by install.js (app/env, app/env-rtx50,
+// app/env-sol, app/env-light) and sam_install.js.
 module.exports = {
   run: [
     // Main Python venv
@@ -8,6 +9,8 @@ module.exports = {
     { method: "fs.rm", params: { path: "app/env-rtx50" } },
     // Preferred RTX 40-series Python 3.11 / CUDA 13 H3 performance venv
     { method: "fs.rm", params: { path: "app/env-sol" } },
+    // CPU / light venv used when Pinokio reports no NVIDIA GPU
+    { method: "fs.rm", params: { path: "app/env-light" } },
     // Optional official LTX-2.5 / Transformers 5.x sidecar venv
     { method: "fs.rm", params: { path: "app/env-ltx25" } },
     // LTX-2.5 sidecars paired to optional CUDA 13 hardware runtimes

@@ -14,14 +14,92 @@ class TestPinokioGpuCompatibility(unittest.TestCase):
         launcher = (_ROOT / "pinokio.js").read_text(encoding="utf-8")
 
         self.assertNotIn("if (kernel.gpu", launcher)
-        self.assertIn('text: "Start"', launcher)
+        # Start is always offered once something is installed; the CPU / light
+        # runtime only changes its label, never whether the entry exists.
+        self.assertIn("text: cpuOnly", launcher)
+        self.assertIn(': "Start",', launcher)
         self.assertIn('href: "start.js"', launcher)
 
-    def test_fresh_install_still_uses_pinokios_documented_gpu_variable(self):
+    def test_fresh_install_keeps_pinokios_gpu_check_without_aborting(self):
         installer = (_ROOT / "install.js").read_text(encoding="utf-8")
 
+        # Pinokio's documented GPU variable stays the trigger for the notice...
         self.assertIn("{{gpu !== 'nvidia'}}", installer)
-        self.assertIn("This app requires an NVIDIA GPU", installer)
+        # ...but it only informs. A machine without an NVIDIA GPU still installs
+        # the CPU / light runtime, so the notice must not stop the script and
+        # the old "requires an NVIDIA GPU" abort text is gone.
+        self.assertNotIn("This app requires an NVIDIA GPU", installer)
+        notice = installer.index("{{gpu !== 'nvidia'}}")
+        # Scope to the whole notify step rather than a fixed-length window: the
+        # notice now branches per platform, and a character budget silently stops
+        # covering the text it is supposed to pin.
+        step = installer[notice:installer.index("\n    },\n", notice)]
+        self.assertNotIn("next: null", step)
+        # Each machine is pointed at the guide that fits its runtime. macOS has its
+        # own dependency set and hardware floor, so it must not be sent to the
+        # generic no-NVIDIA page, and a GPU-less PC must not be sent to the Mac one.
+        self.assertIn("docs/INSTALAR-SIN-NVIDIA.md", step)
+        self.assertIn("docs/INSTALAR-EN-MAC.md", step)
+
+    def test_only_blackwell_keeps_a_driver_stop_and_it_is_the_last_resort(self):
+        installer = (_ROOT / "install.js").read_text(encoding="utf-8")
+
+        # RTX 50 has no CUDA 12.8 fallback, so that combination stays a stop...
+        self.assertIn("isRtx50(kernel) && needsCuda13DriverUpdate(kernel)", installer)
+        # ...while every other NVIDIA card is told about the compatibility
+        # runtime and then continues to install it.
+        self.assertIn(
+            "isSolCapable(kernel) && !isRtx50(kernel) && needsCuda13DriverUpdate(kernel)",
+            installer,
+        )
+        self.assertEqual(installer.count("next: null"), 1)
+
+    def test_cpu_light_runtime_covers_every_launcher_entry_point(self):
+        profile = (_ROOT / "launcher_profile.js").read_text(encoding="utf-8")
+        installer = (_ROOT / "install.js").read_text(encoding="utf-8")
+        torch_script = (_ROOT / "torch.js").read_text(encoding="utf-8")
+        start = (_ROOT / "start.js").read_text(encoding="utf-8")
+        classic = (_ROOT / "start_classic.js").read_text(encoding="utf-8")
+        menu = (_ROOT / "pinokio.js").read_text(encoding="utf-8")
+        updater = (_ROOT / "update.js").read_text(encoding="utf-8")
+        resetter = (_ROOT / "reset.js").read_text(encoding="utf-8")
+        gitignore = (_ROOT / ".gitignore").read_text(encoding="utf-8")
+
+        # Hardware routing: an explicitly reported non-NVIDIA GPU selects the
+        # light runtime; an empty inventory does not (Pinokio can report nothing
+        # for a supported card, which used to abort Install).
+        self.assertIn('env: "env-light"', profile)
+        self.assertIn("const isCpuOnly", profile)
+        self.assertIn("reportedNonNvidiaGpu", profile)
+        self.assertIn("MAESTRO_CPU_RUNTIME", profile)
+        self.assertIn("isCpuOnly(kernel)", installer)
+        self.assertIn("isCpuOnly(kernel)", torch_script)
+        self.assertIn("isCpuOnly(kernel)", start)
+        self.assertIn("!cpuOnly && runtime.env !== legacyRuntime.env", classic)
+
+        # CPU wheels, matching the legacy environment's Python 3.10 / 2.7.1 pin.
+        self.assertIn(
+            "--index-url https://download.pytorch.org/whl/cpu",
+            torch_script,
+        )
+        # The CUDA 13 wheel set follows the environment that was selected, which
+        # is what lets a supported GPU on an older driver keep a working runtime.
+        self.assertIn(
+            'runtime.env === "env-sol" || runtime.env === "env-rtx50"',
+            torch_script,
+        )
+        self.assertNotIn("solCapable && windows", torch_script)
+
+        self.assertIn("CPU / light runtime not installed", start)
+        self.assertIn('runtime.marker', start)
+        self.assertIn('info.exists("app/env-light")', menu)
+        self.assertIn("CPU / light runtime", menu)
+        self.assertIn("runtime.env", updater)
+        self.assertIn('path: "app/env-light"', resetter)
+        self.assertIn("app/env-light/", gitignore)
+
+        # The user-facing guide the notices point at must exist.
+        self.assertTrue((_ROOT / "docs" / "INSTALAR-SIN-NVIDIA.md").is_file())
 
     def test_fresh_install_never_requests_hugging_face_login(self):
         installer = (_ROOT / "install.js").read_text(encoding="utf-8")
