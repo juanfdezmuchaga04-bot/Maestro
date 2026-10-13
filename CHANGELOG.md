@@ -8,6 +8,19 @@ pipeline's own history lives in [app/docs/CHANGELOG.md](app/docs/CHANGELOG.md).
 Production readiness for driving Maestro from a phone, free public compute for
 machines with no GPU, and an integrity fix for cached model receipts.
 
+- **A model catalogue that can prove what it says.** `app/services/model_registry.py`
+  describes a model that comes from anywhere (this tree, a Hugging Face
+  repository) with the same vocabulary `app/services/engine_providers.py`
+  already resolves, and treats *unknown* as a first-class value: every field
+  defaults to “not known”, a positive claim (downloadable, no auth, licence,
+  accelerator, remote inference) must carry an `Evidence` entry naming the URL
+  and the date it was read from, and a resource figure keeps its basis
+  (`measured`, `documented`, `estimated`) so a guess can never be shown as a
+  requirement. A repository is not a service: the Hugging Face adapter reports
+  `download_available` and never claims `remote_inference_available`, because
+  publishing weights says nothing about anybody running them. Discovery also
+  never puts a record in the registry and never downloads anything; the
+  catalogue is explicit, in-memory and JSON round-trippable.
 - **A computer with no GPU and no second machine now renders on free public
   compute, connected by itself.** `app/services/public_cloud.py` asks the public
   Hugging Face Hub which of its Gradio Spaces are *running right now* on free
