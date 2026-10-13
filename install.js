@@ -32,13 +32,17 @@ module.exports = async (kernel) => {
           ? `macOS detected (${kernel.gpu || "Apple GPU"}). Installing Maestro's `
             + "CPU / light runtime: planning, Studio, Films, the editor, the queue "
             + "and remote engine peers all work. Local AI generation needs an "
-            + "NVIDIA GPU, so it stays on another machine. Needs an Apple Silicon "
-            + "Mac on macOS 14 or newer. See docs/INSTALAR-EN-MAC.md."
+            + "NVIDIA GPU, so it runs on a computer of yours with a card or on a "
+            + "free public engine on the internet that Maestro connects to by "
+            + "itself. Needs an Apple Silicon Mac on macOS 14 or newer. See "
+            + "docs/INSTALAR-EN-MAC.md."
           : cpuOnly
             ? `No NVIDIA GPU reported (${kernel.gpu || "not reported"}). Installing `
               + "Maestro's CPU / light runtime: planning, Studio, Films, the editor, "
               + "the queue and remote engine peers all work, but local AI generation "
-              + "needs an NVIDIA GPU. See docs/INSTALAR-SIN-NVIDIA.md."
+              + "needs an NVIDIA GPU: it runs on a computer of yours with a card or "
+              + "on a free public engine on the internet that Maestro connects to "
+              + "by itself. See docs/INSTALAR-SIN-NVIDIA.md."
             : `Pinokio did not report an NVIDIA GPU (${kernel.gpu || "not reported"}). `
               + "Continuing with Maestro's standard NVIDIA runtime. If this machine "
               + "has no NVIDIA GPU, set MAESTRO_CPU_RUNTIME=1 in Pinokio's ENVIRONMENT "
@@ -143,12 +147,14 @@ module.exports = async (kernel) => {
         title: 'Installation completed',
         description: mac
           ? 'Install finished with the macOS CPU / light runtime. Click "Start": every '
-            + 'part of Maestro except local AI generation is available on this Mac (see '
-            + 'docs/INSTALAR-EN-MAC.md).'
+            + 'part of Maestro is available on this Mac, and local AI generation runs '
+            + 'on a computer of yours with a GPU or on a free public engine Maestro '
+            + 'connects to by itself (see docs/INSTALAR-EN-MAC.md).'
           : cpuOnly
             ? 'Install finished with the CPU / light runtime. Click "Start": every '
-              + 'part of Maestro except local AI generation is available (see '
-              + 'docs/INSTALAR-SIN-NVIDIA.md).'
+              + 'part of Maestro is available, and local AI generation runs on a '
+              + 'computer of yours with a GPU or on a free public engine Maestro '
+              + 'connects to by itself (see docs/INSTALAR-SIN-NVIDIA.md).'
             : 'Click "Start" to get started'
       }
     }

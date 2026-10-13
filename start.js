@@ -114,8 +114,8 @@ module.exports = async (kernel) => {
         method: "log",
         params: {
           raw: mac
-            ? "macOS detected: starting Maestro with the CPU / light runtime. Editing, planning, the queue and remote engine peers work; local AI generation runs on a machine with an NVIDIA GPU."
-            : "No NVIDIA GPU detected: starting Maestro with the CPU / light runtime. Editing, planning, the queue and remote engine peers work; local AI generation requires an NVIDIA GPU.",
+            ? "macOS detected: starting Maestro with the CPU / light runtime. Editing, planning, the queue and remote engine peers work; local AI generation runs on a machine with an NVIDIA GPU, or on a free public engine on the internet that this Mac connects to by itself."
+            : "No NVIDIA GPU detected: starting Maestro with the CPU / light runtime. Editing, planning, the queue and remote engine peers work; local AI generation runs on an NVIDIA machine, or on a free public engine on the internet that this computer connects to by itself.",
         },
       }] : []),
       {

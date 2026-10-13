@@ -36,7 +36,7 @@ const localWebEndpoint = (local) => {
 module.exports = {
   version: "8.0",
   title: "Maestro",
-  description: "An all-in-one, 100% local AI creative studio, director, and multi-track editor. Generate with MiniMax H3, LTX-2.5/2.3, Wan, Flux, Qwen, and more; turn an idea or song into a planned production; then finish it on the timeline. Local generation requires an NVIDIA GPU (6GB+ VRAM); on macOS, AMD/Intel machines and any other GPU-less computer Maestro installs a CPU / light runtime where everything except local generation still works — production and generation then run on a machine with a CUDA GPU.",
+  description: "An all-in-one, 100% local AI creative studio, director, and multi-track editor. Generate with MiniMax H3, LTX-2.5/2.3, Wan, Flux, Qwen, and more; turn an idea or song into a planned production; then finish it on the timeline. Local generation requires an NVIDIA GPU (6GB+ VRAM); on macOS, AMD/Intel machines and any other GPU-less computer Maestro installs a CPU / light runtime where everything except local generation still works — production and generation then run on a machine with a CUDA GPU, or — with no other computer at all — on a free public engine on the internet that Maestro finds and connects to by itself.",
   icon: "maestro_simplified_icon_alpha.png",
   menu: async (kernel, info) => {
     const runtime = runtimeProfile(kernel)
@@ -191,8 +191,8 @@ module.exports = {
           icon: "fa-solid fa-power-off",
           text: cpuOnly
             ? (mac
-              ? "<div><strong>Start</strong><div>CPU / light runtime — macOS has no NVIDIA GPU, so Studio, Films, the queue and remote GPU nodes work and local AI generation does not</div></div>"
-              : "<div><strong>Start</strong><div>CPU / light runtime — no NVIDIA GPU detected, so local AI generation is unavailable</div></div>")
+              ? "<div><strong>Start</strong><div>CPU / light runtime — macOS has no NVIDIA GPU, so Studio, Films, the queue and remote GPU nodes work; generation runs on a GPU machine of yours or on a free public engine</div></div>"
+              : "<div><strong>Start</strong><div>CPU / light runtime — no NVIDIA GPU detected; generation runs on a GPU machine of yours or on a free public engine</div></div>")
             : "Start",
           href: "start.js",
         }, {
