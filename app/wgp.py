@@ -2611,7 +2611,17 @@ override_attention_modes_supported = get_supported_override_attention_modes()
 args = _parse_args()
 migrate_loras_layout()
 
-gpu_major, gpu_minor = torch.cuda.get_device_capability(args.gpu if len(args.gpu) > 0 else None)
+# The CPU / light runtime (app/env-light, used by Maestro on a machine with no
+# NVIDIA GPU) ships CPU-only PyTorch wheels, for which any torch.cuda probe
+# raises "Torch not compiled with CUDA enabled" instead of answering. Reading
+# the capability unconditionally aborted startup before the server could come
+# up, which made the whole non-generation surface unreachable. There is no
+# capability to read there and no local generation to configure: the app
+# reports the missing GPU itself in its startup preflight.
+if torch.cuda.is_available():
+    gpu_major, gpu_minor = torch.cuda.get_device_capability(args.gpu if len(args.gpu) > 0 else None)
+else:
+    gpu_major, gpu_minor = 0, 0
 if  gpu_major < 8:
     print("Switching to FP16 models when possible as GPU architecture doesn't support optimed BF16 Kernels")
     bfloat16_supported = False

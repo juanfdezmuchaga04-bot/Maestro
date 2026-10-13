@@ -1,12 +1,59 @@
 """Pinokio launcher regressions that do not require the application runtime."""
 from __future__ import annotations
 
+import ast
+import copy
+import os
 from pathlib import Path
 import re
+from types import SimpleNamespace
 import unittest
 
 
 _ROOT = Path(__file__).resolve().parents[1]
+# Same escape hatch as tests/test_image_runtime_regressions.py: point the engine
+# assertions at another wgp.py (e.g. the pre-fix revision) when checking that a
+# regression test really fails on the code it is meant to pin.
+_WGP = Path(os.environ.get("MAESTRO_TEST_WGP_SOURCE", _ROOT / "app" / "wgp.py"))
+
+
+def _execute(nodes: list[ast.stmt], namespace: dict, filename: Path) -> None:
+    module = ast.fix_missing_locations(ast.Module(body=copy.deepcopy(nodes), type_ignores=[]))
+    exec(compile(module, str(filename), "exec"), namespace)
+
+
+def _module_level_capability_probe(engine: Path):
+    """The two module-level statements that size the engine to the GPU.
+
+    Located by shape rather than position: WanGP reads the compute capability
+    once at import time and turns it into `bfloat16_supported`.
+    """
+    tree = ast.parse(engine.read_text(encoding="utf-8"))
+    guard = next(
+        node for node in tree.body
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "torch.cuda.is_available()"
+    )
+    precision = next(
+        node for node in tree.body
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "gpu_major < 8"
+    )
+    return guard, precision
+
+
+def _fake_engine_globals(cuda_available: bool, capability=()):
+    def get_device_capability(_device=None):
+        # What a CPU-only PyTorch wheel does, verbatim: the message the launcher
+        # used to see as the last line of a failed Start.
+        assert cuda_available, "Torch not compiled with CUDA enabled"
+        return capability
+
+    return {
+        "args": SimpleNamespace(gpu=[]),
+        "torch": SimpleNamespace(cuda=SimpleNamespace(
+            is_available=lambda: cuda_available,
+            get_device_capability=get_device_capability,
+        )),
+    }
 
 
 class TestPinokioGpuCompatibility(unittest.TestCase):
@@ -210,6 +257,44 @@ class TestPinokioGpuCompatibility(unittest.TestCase):
         guard = engine.index("prepare_optional_flash_attention()")
         mmgp_import = engine.index("from mmgp import")
         self.assertLess(guard, mmgp_import)
+
+
+class TestCpuLightEngineBoot(unittest.TestCase):
+    """The CPU / light runtime must be able to load the WanGP engine module.
+
+    `app/env-light` (macOS, AMD/Intel, any machine without an NVIDIA GPU) ships
+    CPU-only PyTorch wheels. Every `torch.cuda` probe raises `AssertionError:
+    Torch not compiled with CUDA enabled` there, and WanGP read the compute
+    capability unconditionally at import time — so Start died before the server
+    existed, which made the whole non-generation surface unreachable.
+    """
+
+    def test_engine_import_reads_the_capability_only_when_cuda_exists(self):
+        engine = _WGP
+        guard, precision = _module_level_capability_probe(engine)
+
+        namespace = _fake_engine_globals(cuda_available=False)
+        _execute([guard, precision], namespace, engine)
+
+        # No capability to read and no local generation to configure: the
+        # fallback keeps the engine importable and matches the pre-Ampere
+        # FP16 path. Maestro reports the missing GPU in its own preflight.
+        self.assertEqual(namespace["gpu_major"], 0)
+        self.assertEqual(namespace["gpu_minor"], 0)
+        self.assertFalse(namespace["bfloat16_supported"])
+
+    def test_engine_import_still_uses_the_real_capability_on_a_cuda_machine(self):
+        engine = _WGP
+        guard, precision = _module_level_capability_probe(engine)
+
+        for capability, expected_bfloat16 in (((8, 9), True), ((9, 0), True), ((7, 5), False)):
+            with self.subTest(capability=capability):
+                namespace = _fake_engine_globals(cuda_available=True, capability=capability)
+                _execute([guard, precision], namespace, engine)
+                self.assertEqual(
+                    (namespace["gpu_major"], namespace["gpu_minor"]), capability
+                )
+                self.assertIs(namespace["bfloat16_supported"], expected_bfloat16)
 
 
 class TestSamInstallerCompatibility(unittest.TestCase):

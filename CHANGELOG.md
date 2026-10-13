@@ -103,6 +103,20 @@ machines with no GPU, and an integrity fix for cached model receipts.
   same-size file replacement is detected even when the filesystem keeps the
   same mtime: the receipt now carries a bounded head/tail content fingerprint,
   and a receipt without one is re-verified instead of trusted.
+- **Start now works on the CPU / light runtime.** `app/wgp.py` read the CUDA
+  compute capability unconditionally at import time, and a CPU-only PyTorch wheel
+  (every `app/env-light` machine: macOS, AMD, Intel, any computer with no NVIDIA
+  GPU) answers every `torch.cuda` probe with `AssertionError: Torch not compiled
+  with CUDA enabled`. The engine module therefore failed to load before the server
+  existed, so the launcher's own "Start — CPU / light runtime" action could not
+  bring Maestro up at all and the whole non-generation surface — UI, Studio,
+  Films, editor, planning, queue, remote GPU nodes, free public compute — was
+  unreachable. The capability read is now taken only when CUDA is present, and the
+  light runtime falls back to the FP16 settings (the pre-Ampere path) since it has
+  no local generation to configure; Maestro's own preflight continues to report
+  the missing GPU. Pinned by `tests/test_launcher_compatibility.py`
+  (`TestCpuLightEngineBoot`), which executes the capability block against a
+  CPU-only PyTorch stub.
 
 ## [2.6.0] - 2026-10-04
 
