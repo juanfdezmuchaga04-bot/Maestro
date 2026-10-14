@@ -129,3 +129,5 @@ GET  /api/v1/auto-production/{id}/video      → el vídeo final
 ```
 
 Las imágenes se suben antes con `POST /api/v1/upload`, y se usa el `path` que devuelve.
+
+> Hoja de ruta para más calidad y menos tiempo: [Plan de calidad y velocidad](PLAN-CALIDAD-Y-VELOCIDAD.md).
