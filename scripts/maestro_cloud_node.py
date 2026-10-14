@@ -45,6 +45,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -127,16 +128,45 @@ def place_storage(storage: str, app: str = APP) -> None:
     os.environ.setdefault("HF_HOME", os.path.join(storage, "hf-home"))
 
 
-def wait_for(url: str, token: str, timeout: float) -> bool:
-    deadline = time.time() + timeout
+def last_line(path: str) -> str:
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 4096))
+            lines = [line for line in handle.read().decode("utf-8", "replace").splitlines() if line.strip()]
+        return lines[-1][-160:] if lines else "(no output yet)"
+    except OSError:
+        return "(no log yet)"
+
+
+def wait_for(url: str, token: str, timeout: float, process: subprocess.Popen | None = None,
+             log_path: str = "", label: str = "Maestro") -> bool:
+    """Wait until ``url`` answers 200, reporting progress every minute.
+
+    Stops early when the server process has exited, and says so when the server
+    answers but refuses the token (a sign-in problem, not a slow start).
+    """
+    started = time.time()
+    deadline = started + timeout
+    next_report = started + 60
     while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            log(f"{label} exited (code {process.returncode}) while starting. Last log line: {last_line(log_path)}")
+            return False
         try:
             request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
             with urllib.request.urlopen(request, timeout=10) as response:
                 if response.status == 200:
+                    log(f"{label} is up after {int(time.time() - started)} s.")
                     return True
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403):
+                log(f"{label} answers but refuses the token (HTTP {error.code}); check MAESTRO_ACCESS_TOKEN.")
         except Exception:  # noqa: BLE001 - still starting
             pass
+        if time.time() >= next_report:
+            log(f"{label} still starting ({int(time.time() - started)} s) · {last_line(log_path)}")
+            next_report += 60
         time.sleep(5)
     return False
 
@@ -188,7 +218,8 @@ def start_node(index: int, app: str, gpu_index: int, port: int, token: str, pyth
         "The first start imports the engine and can take several minutes.")
     server = subprocess.Popen([python, "launch.py"], cwd=app, env=env,
                               stdout=open(log_path, "a", encoding="utf-8"), stderr=subprocess.STDOUT)
-    if not wait_for(f"http://127.0.0.1:{port}/api/v1/engines", token, timeout):
+    if not wait_for(f"http://127.0.0.1:{port}/api/v1/engines", token, timeout, server, log_path,
+                    label=f"Node {index + 1}"):
         server.terminate()
         raise cloud_node.CloudNodeError(f"Node {index + 1} did not answer within {int(timeout)} s; "
                                         f"see the end of {log_path}.")
