@@ -46,7 +46,8 @@ ROUTE_KINDS = {
 ROUTES: dict[str, dict[str, Any]] = {
     "hf_zerogpu": {
         "label": "Hugging Face ZeroGPU Spaces", "kind": "public_space",
-        "limits": "About 2 GPU-minutes/day anonymous, 5 with a free account, 40 with PRO; shared queue",
+        "limits": "NVIDIA H200 slice with 70 GB VRAM per call; 2 GPU-minutes/day anonymous, 3.5 with a free "
+                  "account, 25 with PRO (official table, 2026-10; earlier pages said 5 / 40); shared queue",
         "account": "None needed (a free HF account raises the quota)",
         "maestro": "Integrated: Studio → Compute & transfer → Public compute (automatic discovery)",
         "source": "https://huggingface.co/docs/hub/en/spaces-zerogpu", "confidence": "official",
