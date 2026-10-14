@@ -100,6 +100,8 @@ from services import production_queue_api
 from services import remote_engine as remote_engine_service
 from services import engine_routing as engine_routing_service
 from services import public_cloud as public_cloud_service
+from services import external_media as external_media_service
+from services import external_media_api as external_media_api_service
 from services import upload_api as upload_api_service
 
 # Protect upgraded installations before WanGP builds its model registry.  Old
@@ -31396,6 +31398,33 @@ def _recover_generation_queue_on_start(_app=None):
 
 api.add_event_handler("startup", _recover_generation_queue_on_start)
 api.include_router(production_queue_api.create_router(root_provider=_film_queue_root))
+
+
+# ============================================================================
+# Opt-in external providers (Cloudflare Workers AI, Replicate)
+# ============================================================================
+# Commercial APIs are never part of the automatic routing above.  They live in
+# services.external_media: off until the user enables one and stores their own
+# key (OS credential store, see services.external_secrets), and every job runs
+# only after its cost/data disclosure was confirmed.  Results are written into
+# the active workspace, so they appear in the gallery like any other output.
+_external_media_manager = None
+_external_media_lock = threading.Lock()
+
+
+def _external_media() -> "external_media_service.ExternalMediaManager":
+    global _external_media_manager
+    with _external_media_lock:
+        if _external_media_manager is None:
+            _external_media_manager = external_media_service.ExternalMediaManager(
+                os.path.join(_maestro_settings_dir, "external_providers"),
+                output_dir=lambda: (_get_active_workspace(), _workspace_dir()),
+            )
+        return _external_media_manager
+
+
+api.add_event_handler("startup", lambda: _external_media())
+api.include_router(external_media_api_service.create_router(_external_media))
 
 
 # ============================================================================

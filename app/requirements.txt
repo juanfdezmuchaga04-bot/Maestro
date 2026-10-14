@@ -137,3 +137,8 @@ json_repair==0.59.5
 # huggingface_hub[hf_xet]  # slows down everything
 iopath>=0.1.10
 pycocotools
+
+# Opt-in external providers (services/external_secrets.py): API keys go to the OS
+# credential store (Windows Credential Manager / macOS Keychain / Secret Service).
+# Pure Python; without it keys fall back to a DPAPI-encrypted or 0600 file.
+keyring==25.6.0

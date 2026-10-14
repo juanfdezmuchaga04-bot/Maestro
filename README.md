@@ -1027,6 +1027,10 @@ After clicking **Start**, the launcher shows an **Open Web UI** button once the 
 - **Settings drawer** (gear icon) — model visibility, performance auto-tune, services (LLM, API keys, NSFW, theme)
 - **Pinokio menu** — Update, Reset, Install Inpaint Support, LoRA folder shortcuts
 
+## External providers (opt-in, your own account)
+
+The **Cloud** mode sends an image or video request to a commercial API only when you ask it to: **Cloudflare Workers AI** (FLUX.1 schnell images, free within 10,000 Neurons per day, no card) and **Replicate** (FLUX.1 schnell images ≈ $0.003, Wan 2.2 T2V Fast videos ≈ $0.05 at 480p / $0.10 at 720p). Both are off until you enable one and add your own key, which is kept in the operating system's credential store rather than Maestro's settings file. Every job shows the provider, the exact data that leaves the computer, the estimated cost with its basis, account requirements and limits, and starts only after you confirm; the server refuses a request whose confirmation does not match it. Jobs show live status, can be cancelled (remotely on Replicate), surface the provider's real error (missing key, no credit, spent free quota, rate limit, timeout) and are marked done only when a real file of the requested type was saved to the workspace. Local engines and automatic routing are unchanged. Setup, costs and what has and has not been tested live: [Proveedores externos](docs/PROVEEDORES-EXTERNOS.md). For AMD laptops such as the Lenovo IdeaPad S145, `python scripts/diagnose_gpu.py` identifies the exact GPU and which local backends are worth testing: [Diagnóstico AMD / S145](docs/DIAGNOSTICO-AMD-S145.md).
+
 ## Free public compute
 
 A computer with no CUDA GPU and no second machine of its own can still render. Maestro connects to a free public engine on the internet by itself — no install, no account, no key, nothing to switch on:

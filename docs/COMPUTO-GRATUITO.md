@@ -85,8 +85,10 @@ se leyó; lo que no se pudo verificar se dice como tal en vez de darlo por bueno
   `public_cloud` se registra con `free: True` y `requires_api_key=False`
   (Spaces anónimos de ZeroGPU), tal como describe [Free public
   compute](PUBLIC-COMPUTE.md).
-- **No hay nada que “desactivar”**: no existe hoy ningún proveedor de pago
-  registrado en la aplicación.
+- **Actualización 2026-10-14:** existen ahora proveedores externos **opt-in**
+  (Cloudflare Workers AI y Replicate) en el modo *Cloud*, fuera del enrutado
+  automático: apagados por defecto, con clave propia y confirmación de coste por
+  trabajo. Ver [PROVEEDORES-EXTERNOS.md](PROVEEDORES-EXTERNOS.md).
 - Si en el futuro se añade un tier gratuito más, el único candidato sin tarjeta
   y con cuota publicada es **Cloudflare Workers AI, solo imagen** (token propio
   del usuario, nunca embebido en la app). El video seguiría dependiendo de

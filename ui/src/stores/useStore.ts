@@ -10552,6 +10552,9 @@ export const useStore = create<AppState>((set, get) => ({
       // Films is a full-canvas workspace: productions, storyboards and the
       // assembled cut, rather than the single-generation Studio sidecar.
       set({ sidebarMode: 'productions', sidebarOpen: false, settingsOpen: false })
+    } else if (mode === 'external') {
+      // Opt-in cloud providers are a full-canvas workspace like Films.
+      set({ sidebarMode: 'external', sidebarOpen: false, settingsOpen: false })
     } else {
       // Editor owns the full canvas rather than living inside the Studio
       // sidebar. Close the mobile drawer as we hand the app shell over.

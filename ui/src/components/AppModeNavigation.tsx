@@ -6,6 +6,7 @@ const APP_MODES: Array<{ mode: AppMode; label: string }> = [
   { mode: 'studio', label: 'Studio' },
   { mode: 'productions', label: 'Films' },
   { mode: 'editor', label: 'Editor' },
+  { mode: 'external', label: 'Cloud' },
 ]
 
 export function MaestroBrand({

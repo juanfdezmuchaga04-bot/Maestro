@@ -18,6 +18,7 @@ import { OfflineBanner } from './components/OfflineBanner'
 import { NotificationToastHost } from './components/NotificationToastHost'
 import { EditorWorkspace } from './editor/EditorWorkspace'
 import { StudioWorkspace } from './studio/StudioWorkspace'
+import { ExternalWorkspace } from './external/ExternalWorkspace'
 import { MaestroBrand } from './components/AppModeNavigation'
 import { EditorRoundTripBanner } from './editor/EditorRoundTripBanner'
 import { useStore } from './stores/useStore'
@@ -39,8 +40,8 @@ function App() {
   const sidebarMode = useStore(s => s.sidebarMode)
   const isMobile = useIsMobileSidecar()
   const isEditor = sidebarMode === 'editor'
-  // Films and the Editor both take the whole canvas instead of the Studio sidecar.
-  const isFullCanvas = isEditor || sidebarMode === 'productions'
+  // Films, the Editor and External providers take the whole canvas instead of the Studio sidecar.
+  const isFullCanvas = isEditor || sidebarMode === 'productions' || sidebarMode === 'external'
 
   useEffect(() => {
     loadModels()
@@ -100,6 +101,8 @@ function App() {
 
       {sidebarMode === 'productions' ? (
         <StudioWorkspace />
+      ) : sidebarMode === 'external' ? (
+        <ExternalWorkspace />
       ) : isEditor ? (
         <EditorWorkspace />
       ) : (

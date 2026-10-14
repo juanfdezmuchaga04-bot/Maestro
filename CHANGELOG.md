@@ -8,6 +8,34 @@ pipeline's own history lives in [app/docs/CHANGELOG.md](app/docs/CHANGELOG.md).
 Production readiness for driving Maestro from a phone, free public compute for
 machines with no GPU, and an integrity fix for cached model receipts.
 
+- **Opt-in external image and video providers.** A new **Cloud** mode generates
+  images with Cloudflare Workers AI (FLUX.1 schnell, free daily Neurons) or
+  Replicate (FLUX.1 schnell), and videos with Replicate (Wan 2.2 T2V Fast).
+  `app/services/external_media.py` keeps every provider off until it is enabled
+  and has the user's own key; each job is quoted first (provider, model, the data
+  that is sent, estimated cost and its basis, account requirements, limits,
+  retention, cancellation) and `POST /api/v1/external/jobs` only accepts the
+  `confirm_token` of that exact request. Failures keep their cause
+  (`missing_credentials`, `auth_failed`, `insufficient_credit`,
+  `quota_exhausted`, `rate_limited`, `invalid_input`, `provider_unavailable`,
+  `timeout`, `network_error`, `provider_failed`, `invalid_output`); a job is
+  `succeeded` only once a downloaded file was recognised as the requested media
+  and written to the active workspace with its `.meta.json`. Replicate
+  predictions are cancelled remotely (also on timeout) and resumed after a
+  restart; Cloudflare's synchronous call is cancelled locally and says it may
+  still consume quota. Keys live in `app/services/external_secrets.py`: the OS
+  credential store through `keyring` (new requirement), DPAPI on Windows
+  without it, or a `0600` file, and are never returned by the API. The
+  automatic routing is unchanged (`allow_commercial=False`). No live generation
+  against either provider has been run yet; see `docs/PROVEEDORES-EXTERNOS.md`.
+- **GPU diagnosis for AMD laptops such as the Lenovo IdeaPad S145.**
+  `scripts/diagnose_gpu.py` (read-only) reports the machine model, OS build,
+  CPU, RAM and each display adapter by PCI ID, maps it to the S145 variant and
+  GPU family, and rates ROCm, DirectML, Vulkan and CPU without claiming any of
+  them works; only `--probe` can mark a backend as passed, by running a
+  computation on it. `docs/DIAGNOSTICO-AMD-S145.md` lists the variants and the
+  local alternatives evaluated for CPU and AMD.
+
 - **A model catalogue that can prove what it says.** `app/services/model_registry.py`
   describes a model that comes from anywhere (this tree, a Hugging Face
   repository) with the same vocabulary `app/services/engine_providers.py`
