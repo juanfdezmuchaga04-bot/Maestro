@@ -8,6 +8,25 @@ pipeline's own history lives in [app/docs/CHANGELOG.md](app/docs/CHANGELOG.md).
 Production readiness for driving Maestro from a phone, free public compute for
 machines with no GPU, and an integrity fix for cached model receipts.
 
+- **Model library: every model, every way to reach it, downloads on any computer.**
+  `app/services/model_manifest.json` lists all 211 model definitions, 11 LLMs,
+  MMAudio and Whisper with every file they need — including the text encoders,
+  VAEs and tokenizers each family handler declares in code.
+  `scripts/build_model_manifest.py` produces it without PyTorch or a GPU by
+  importing the handlers against inert stand-ins, and a test fails if it drifts
+  from `app/defaults` or `wgp.family_handlers`. `app/services/model_access.py`
+  records, per family, the licence (with territory exclusions such as
+  HunyuanVideo's and MiniMax H3's EU carve-outs), every free API, trial, public
+  Space and paid API found on 2026-10-14 with its source and confidence, and the
+  local engines that work without NVIDIA. `app/services/model_downloads.py`
+  (standard library only) plans one file per group of alternative precisions,
+  never picks NVFP4/Nunchaku/FP8 by default off NVIDIA, asks the Hub for size,
+  SHA-256 and gating, and downloads with resume, verification, cancellation, a
+  disk-space check and licence acknowledgement, into the folders Maestro loads
+  from. The **Models** mode adds the Model library tab; `scripts/maestro_models.py`
+  does the same from a terminal. No real Hub download has been run from the
+  development environment (no route to huggingface.co); see
+  `docs/MODELOS-ACCESO-Y-DESCARGA.md`.
 - **Opt-in external image and video providers.** A new **Cloud** mode generates
   images with Cloudflare Workers AI (FLUX.1 schnell, free daily Neurons) or
   Replicate (FLUX.1 schnell), and videos with Replicate (Wan 2.2 T2V Fast).

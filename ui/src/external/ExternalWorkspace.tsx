@@ -13,6 +13,7 @@ import {
   X,
 } from 'lucide-react'
 import { AppModeToggle, MaestroBrand } from '../components/AppModeNavigation'
+import { ModelLibrary } from './ModelLibrary'
 import { useStore } from '../stores/useStore'
 import {
   ExternalApiError,
@@ -347,6 +348,7 @@ export function ExternalWorkspace() {
   const [quote, setQuote] = useState<ExternalQuote | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [tab, setTab] = useState<'library' | 'cloud'>('library')
 
   const refresh = useCallback(async () => {
     try {
@@ -453,8 +455,22 @@ export function ExternalWorkspace() {
       <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border bg-bg-secondary px-3 py-2">
         <MaestroBrand compact />
         <div className="leading-tight">
-          <div className="text-sm font-semibold text-text-primary">External providers</div>
-          <div className="text-[10px] text-text-muted">Opt-in cloud image and video generation</div>
+          <div className="text-sm font-semibold text-text-primary">Models &amp; cloud</div>
+          <div className="text-[10px] text-text-muted">Model library, downloads and opt-in cloud generation</div>
+        </div>
+        <div className="flex rounded-lg border border-border bg-bg-tertiary p-0.5" role="tablist">
+          {([['library', 'Model library'], ['cloud', 'Cloud generation']] as const).map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              aria-selected={tab === id}
+              onClick={() => setTab(id)}
+              className={`rounded-md px-3 py-1 text-xs ${tab === id ? 'bg-bg-hover text-text-primary' : 'text-text-secondary hover:text-text-primary'}`}
+            >
+              {label}
+            </button>
+          ))}
         </div>
         <div className="ml-auto flex items-center gap-2">
           <button
@@ -469,6 +485,7 @@ export function ExternalWorkspace() {
         </div>
       </header>
 
+      {tab === 'library' ? <ModelLibrary /> : (
       <div className="grid min-h-0 flex-1 gap-4 overflow-y-auto p-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
         <div className="flex min-w-0 flex-col gap-4">
           {loadError && <p className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-300">{loadError}</p>}
@@ -596,6 +613,7 @@ export function ExternalWorkspace() {
           ))}
         </div>
       </div>
+      )}
     </div>
   )
 }

@@ -102,6 +102,8 @@ from services import engine_routing as engine_routing_service
 from services import public_cloud as public_cloud_service
 from services import external_media as external_media_service
 from services import external_media_api as external_media_api_service
+from services import model_downloads as model_downloads_service
+from services import model_library_api as model_library_api_service
 from services import upload_api as upload_api_service
 
 # Protect upgraded installations before WanGP builds its model registry.  Old
@@ -31425,6 +31427,29 @@ def _external_media() -> "external_media_service.ExternalMediaManager":
 
 api.add_event_handler("startup", lambda: _external_media())
 api.include_router(external_media_api_service.create_router(_external_media))
+
+
+# Model library: every model Maestro ships, every way to reach it (free APIs, trials,
+# public Spaces, local engines) and downloads that need no GPU and no PyTorch.  The
+# files land in the same checkpoint folders wgp reads, so a model fetched here is used
+# as-is.  services.model_downloads also runs standalone: scripts/maestro_models.py.
+_model_library_manager = None
+
+
+def _model_library() -> "model_downloads_service.DownloadManager":
+    global _model_library_manager
+    if _model_library_manager is None:
+        roots = list(wgp.server_config.get("checkpoints_paths") or ["ckpts"])
+        _model_library_manager = model_downloads_service.DownloadManager(
+            _app_dir,
+            checkpoints_root=roots[0] if roots else "ckpts",
+            extra_roots=roots[1:],
+            state_dir=os.path.join(_maestro_settings_dir, "model_downloads"),
+        )
+    return _model_library_manager
+
+
+api.include_router(model_library_api_service.create_router(_model_library))
 
 
 # ============================================================================
