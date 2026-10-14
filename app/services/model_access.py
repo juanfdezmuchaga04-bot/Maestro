@@ -34,6 +34,7 @@ ROUTE_KINDS = {
     "free_web": "Free web app from the model's authors (no programmatic API confirmed)",
     "public_space": "Public demo Space (Gradio); usable through Maestro's public compute, limited GPU minutes",
     "trial_credits": "One-time or promotional credits; payment needed afterwards",
+    "free_gpu_notebook": "Free NVIDIA GPU notebook: run the model yourself inside the notebook session",
     "paid": "Paid API (reference only)",
     "local": "Runs on your own hardware with the downloaded weights",
 }
@@ -62,7 +63,7 @@ ROUTES: dict[str, dict[str, Any]] = {
         "limits": "10,000 Neurons/day free, reset 00:00 UTC (FLUX.1 schnell ≈ 58 Neurons per 1024² image; "
                   "Whisper large-v3-turbo ≈ 47 Neurons per audio minute; MeloTTS ≈ 19 per minute)",
         "account": "Cloudflare account (Free plan, no card) + API token + Account ID",
-        "maestro": "Integrated for FLUX.1 [schnell] (Cloud mode)",
+        "maestro": "Integrated (Cloud mode): FLUX.1 [schnell], FLUX.2 [klein] 4B and 9B",
         "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/", "confidence": "official",
     },
     "modelscope": {
@@ -70,7 +71,7 @@ ROUTES: dict[str, dict[str, Any]] = {
         "limits": "Historically 2,000 calls/day (UTC+8 reset); a Sept-2026 report shows a balance-based "
                   "system instead. Non-commercial experimentation, limited concurrency",
         "account": "ModelScope account linked to a real-name-verified Alibaba Cloud account + ModelScope token",
-        "maestro": "Not integrated",
+        "maestro": "Integrated (Cloud mode): Qwen-Image 20B, Z-Image Turbo, Qwen-Image 2.1",
         "source": "https://lilting.ch/en/articles/modelscope-api-inference-magicube-probe", "confidence": "secondary",
     },
     "google_ai_studio": {
@@ -130,6 +131,20 @@ ROUTES: dict[str, dict[str, Any]] = {
         "account": "SiliconFlow account (real-name verification since May 2026; servers in China)",
         "maestro": "Not integrated",
         "source": "https://pricepertoken.com/endpoints/siliconflow/free", "confidence": "secondary",
+    },
+    "kaggle_notebook": {
+        "label": "Kaggle Notebooks (free NVIDIA GPU)", "kind": "free_gpu_notebook",
+        "limits": "T4 ×2 (16 GB each) or P100; ≈ 30 GPU-hours/week; sessions up to 9–12 h; ≈ 20 GB persistent disk",
+        "account": "Free Kaggle account, phone-verified for GPU and internet",
+        "maestro": "Not integrated: run the model in the notebook (personal, non-commercial use per Kaggle's terms)",
+        "source": "https://www.kaggle.com/docs/notebooks", "confidence": "secondary",
+    },
+    "lightning_studio": {
+        "label": "Lightning AI Studios (free monthly credits)", "kind": "free_gpu_notebook",
+        "limits": "Free monthly credits reported ≈ 80 GPU-hours on T4; phone verification, no card reported",
+        "account": "Free Lightning AI account",
+        "maestro": "Not integrated: run the model in the Studio",
+        "source": "https://lightning.ai/pricing/", "confidence": "secondary",
     },
     "acemusic": {
         "label": "acemusic.ai (ACE-Step authors)", "kind": "free_web",
@@ -320,7 +335,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "label": "FLUX.2 [klein] 4B (and Base)", "modality": "image", "license": "Apache-2.0",
         "license_url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B", "territory": "",
         "max_output": "up to 4 MP",
-        "routes": [_r("cloudflare", "@cf/black-forest-labs/flux-2-klein-4b (4 steps)", "official",
+        "routes": [_r("cloudflare", "@cf/black-forest-labs/flux-2-klein-4b (4 steps) — integrated in Maestro", "official",
                       "https://developers.cloudflare.com/workers-ai/models/flux-2-klein-4b/"),
                    _r("vercel_ai_gateway"), _r("nvidia_build", "FLUX.2 Klein hosted", "secondary"), _r("bfl_api")],
         "local": ["wan2gp_cuda", "comfyui", "sdcpp"],
@@ -329,7 +344,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "label": "FLUX.2 [klein] 9B (and Base)", "modality": "image", "license": "FLUX Non-Commercial License",
         "license_url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-9B", "territory": "",
         "max_output": "up to 4 MP; up to 4 reference images",
-        "routes": [_r("cloudflare", "@cf/black-forest-labs/flux-2-klein-9b; $0.015 first MP on paid usage", "official",
+        "routes": [_r("cloudflare", "@cf/black-forest-labs/flux-2-klein-9b — integrated in Maestro", "official",
                       "https://developers.cloudflare.com/workers-ai/models/flux-2-klein-9b/"),
                    _r("vercel_ai_gateway"), _r("bfl_api")],
         "local": ["wan2gp_cuda", "comfyui", "sdcpp"],
@@ -338,7 +353,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "label": "Qwen-Image 20B (2512, Edit, Edit Plus, Layered, Lightning, GGUF, Nunchaku)", "modality": "image",
         "license": "Apache-2.0", "license_url": "https://huggingface.co/Qwen/Qwen-Image", "territory": "",
         "max_output": "≈ 1.7 MP (1328²)",
-        "routes": [_r("modelscope", "Qwen-Image family on the free API-Inference quota", "secondary"),
+        "routes": [_r("modelscope", "Qwen/Qwen-Image on the free API-Inference quota — integrated in Maestro", "secondary"),
                    _r("alibaba_model_studio", "Hosted Qwen-Image APIs"), _r("fal"),
                    _r("replicate", "Qwen-Image via WaveSpeed on Replicate", "secondary")],
         "local": ["wan2gp_cuda", "comfyui", "sdcpp"],
@@ -347,7 +362,8 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "label": "Qwen-Image 2.1 (7B)", "modality": "image",
         "license": "Qwen Research License — non-commercial research/evaluation only",
         "license_url": "https://huggingface.co/Qwen/Qwen-Image-2.1", "territory": "", "max_output": "≈ 2 MP",
-        "routes": [_r("modelscope", "Free API listed; real-name-verified Alibaba Cloud account required", "secondary"),
+        "routes": [_r("modelscope", "Qwen/Qwen-Image-2.1 — integrated in Maestro; real-name-verified Alibaba Cloud account required",
+                      "secondary"),
                    _r("alibaba_model_studio", "Qwen-Image-2.1 Pro / Turbo hosted (paid)", "secondary")],
         "local": ["wan2gp_cuda", "comfyui"],
     },
@@ -355,7 +371,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "label": "Z-Image (Turbo / Base / ControlNet / TwinFlow, 6B)", "modality": "image", "license": "Apache-2.0",
         "license_url": "https://huggingface.co/Tongyi-MAI/Z-Image-Turbo", "territory": "", "max_output": "≈ 2 MP",
         "routes": [_r("hf_zerogpu", "Official Space Tongyi-MAI/Z-Image-Turbo", "secondary"),
-                   _r("modelscope", "Z-Image-Turbo on the free API-Inference quota", "secondary")],
+                   _r("modelscope", "Tongyi-MAI/Z-Image-Turbo — integrated in Maestro", "secondary")],
         "local": ["wan2gp_cuda", "comfyui"],
     },
     "hidream_o1": {
@@ -503,6 +519,16 @@ def access_for(family: str, item_id: str = "") -> dict[str, Any]:
             "confidence": entry.get("confidence") or service["confidence"],
             "same_weights": same_weights,
         })
+    if "wan2gp_cuda" in data["local"]:
+        # Every model Maestro's NVIDIA engine runs can also run on a free NVIDIA notebook GPU,
+        # VRAM permitting (16 GB on a T4).
+        for key in ("kaggle_notebook", "lightning_studio"):
+            service = ROUTES[key]
+            routes.append({"id": key, "label": service["label"], "kind": service["kind"],
+                           "kind_label": ROUTE_KINDS[service["kind"]],
+                           "note": "Same NVIDIA hardware class Maestro targets; fits if the model fits in 16 GB VRAM",
+                           "limits": service["limits"], "account": service["account"], "maestro": service["maestro"],
+                           "source": service["source"], "confidence": service["confidence"], "same_weights": True})
     local = [{"id": key, **LOCAL_BACKENDS[key]} for key in data["local"]]
     return {**{k: v for k, v in data.items() if k not in ("routes", "local")}, "family": family,
             "routes": routes, "local_backends": local,

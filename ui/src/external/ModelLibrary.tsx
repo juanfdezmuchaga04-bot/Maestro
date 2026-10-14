@@ -28,6 +28,7 @@ const KIND_STYLE: Record<string, string> = {
   free_web: 'border-accent-green/30 text-accent-green',
   public_space: 'border-accent-blue/50 text-accent-blue',
   trial_credits: 'border-amber-400/50 text-amber-400',
+  free_gpu_notebook: 'border-accent-green/40 text-accent-green',
   paid: 'border-border text-text-muted',
 }
 

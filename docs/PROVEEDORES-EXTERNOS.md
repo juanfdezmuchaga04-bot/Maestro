@@ -13,6 +13,9 @@ Fecha de verificación de la documentación de los proveedores: **2026-10-14**.
 | Proveedor | Modalidad | Modelo | Coste (estimación) | Cuenta | Cancelación |
 |---|---|---|---|---|---|
 | **Cloudflare Workers AI** | Imagen | `@cf/black-forest-labs/flux-1-schnell` (Apache-2.0) | **Gratis dentro de 10 000 Neurons/día** (reinicio 00:00 UTC). 1024×1024 a 4 pasos ≈ 57,6 Neurons (4,80/tesela 512² + 9,60/paso) → ~170 imágenes/día. Con Workers Paid, $0,011 por 1 000 Neurons extra | Cuenta Cloudflare (plan Free sin tarjeta), **Account ID** y **API token** con permiso *Workers AI* | **Solo local**: la llamada es síncrona y no hay endpoint de cancelación; Maestro deja de esperar y lo dice (puede consumir cuota) |
+| **Cloudflare Workers AI** | Imagen | `@cf/black-forest-labs/flux-2-klein-4b` (Apache-2.0), hasta 1536×1024 | **Gratis dentro de la cuota**: 26,05 Neurons por tesela 512² de salida → 1024×1024 ≈ 104 Neurons (~96 imágenes/día) | Igual que arriba; se envía como *multipart*; 4 pasos fijos | Solo local |
+| **Cloudflare Workers AI** | Imagen | `@cf/black-forest-labs/flux-2-klein-9b` (**licencia no comercial**) | 0,015 $ el primer MP + 0,002 $/MP extra → 1024×1024 ≈ 1 364 Neurons (~7 imágenes/día gratis) | Igual que arriba | Solo local |
+| **ModelScope API-Inference** | Imagen | `Qwen/Qwen-Image` (Apache-2.0, hasta 1664×928), `Tongyi-MAI/Z-Image-Turbo` (Apache-2.0, hasta 2048×2048), `Qwen/Qwen-Image-2.1` (solo investigación) | **Gratis** dentro de la cuota de API-Inference (publicada como 2 000 llamadas/día; un informe de sept. 2026 describe un sistema de saldo) | Cuenta ModelScope **vinculada a una cuenta de Alibaba Cloud con verificación de identidad real** + token de acceso de ModelScope | Solo local (sin llamada de cancelación documentada) |
 | **Replicate** | Imagen | `black-forest-labs/flux-schnell` (Apache-2.0) | ≈ **$0,003/imagen** (página del modelo) | Cuenta Replicate **con facturación** (crédito o tarjeta) y **API token** | **Remota**: `POST /v1/predictions/{id}/cancel` |
 | **Replicate** | Vídeo | `wan-video/wan-2.2-t2v-fast` (Apache-2.0) | ≈ **$0,05 a 480p, $0,10 a 720p** por vídeo de 81 fotogramas (precio de lanzamiento); más fotogramas se estiman proporcionalmente | Igual que arriba | **Remota** |
 
@@ -107,6 +110,22 @@ con el id guardado en lugar de volver a cobrar o abandonarla.
 4. En Maestro: modo **Cloud** → tarjeta *Cloudflare Workers AI* → pega Account ID y
    token → **Save keys** → **Check key (free)** → marca **Enabled**.
 
+**ModelScope (Qwen-Image y Z-Image, gratis dentro de la cuota)**
+
+1. Crea una cuenta en <https://modelscope.cn/register> y vincúlala a una cuenta de
+   Alibaba Cloud que haya pasado la **verificación de identidad real**. ModelScope es
+   una plataforma china: las peticiones se procesan en China continental y la
+   verificación puede no estar disponible para todas las nacionalidades (lo decide
+   ModelScope, no Maestro). Si falta este paso, Maestro muestra
+   `account_requirement` con el mensaje de ModelScope.
+2. Copia tu **token de acceso** (en ModelScope, *Access Token*; no es una clave de DashScope).
+3. En Maestro: **Models → Cloud generation** → tarjeta *ModelScope* → pega el token →
+   **Save keys** → **Check key (free)** → **Enabled**. En *Generate* elige el modelo
+   (Qwen-Image 20B, Z-Image Turbo o Qwen-Image 2.1) y el tamaño.
+
+**Cloudflare FLUX.2 [klein]**: usa la misma cuenta y token que FLUX.1 schnell; en
+*Generate* elige el proveedor Cloudflare y el modelo «FLUX.2 [klein] 4B» o «9B».
+
 **Replicate (imagen y vídeo, de pago)**
 
 1. Crea una cuenta en <https://replicate.com/signin> y configura la facturación
@@ -153,6 +172,17 @@ POST   /api/v1/external/jobs/{id}/cancel
   error de cuota mostrado con su código, vídeo con estados en vivo y archivo MP4
   reproducido desde la galería. Esto valida la interfaz, **no** a los proveedores.
 - `npm run lint`, `npm run build`, ruff F821/F823 y las pruebas de lanzador.
+
+**Ampliación del 2026-10-14 (FLUX.2 klein y ModelScope):** 4 pruebas más con el
+transporte simulado: petición *multipart* sin `steps` y coste en Neurons por tesela,
+licencia no comercial del 9B en la divulgación, tarea asíncrona de ModelScope
+(cabeceras `X-ModelScope-Async-Mode` / `X-ModelScope-Task-Type`, sondeo hasta
+`SUCCEED`), cuota agotada, token rechazado, verificación de identidad pendiente y tarea
+fallida con su motivo. **Ninguna llamada real** a estos endpoints: el formato de
+ModelScope procede de documentación de terceros coherente entre sí, no de una
+referencia oficial, y el formato de salida de FLUX.2 klein en Workers AI (imagen en
+base64 dentro de JSON) no se pudo leer en la página oficial; Maestro acepta ambos
+formatos (JSON con base64 o imagen directa) y rechaza cualquier otro.
 
 **No probado (pendiente, requiere tus credenciales y tu confirmación de coste):**
 

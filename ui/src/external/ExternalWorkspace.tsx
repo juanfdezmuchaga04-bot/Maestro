@@ -110,6 +110,12 @@ function ProviderCard({
         )}
         <div><dt className="inline font-medium text-text-primary">Data retention: </dt><dd className="inline">{provider.retention}</dd></div>
         <div><dt className="inline font-medium text-text-primary">Cancellation: </dt><dd className="inline">{provider.cancel_note}</dd></div>
+        {Object.entries(provider.extra_models || {}).map(([key, model]) => (
+          <div key={key}>
+            <dt className="inline font-medium text-text-primary">{model.modality}: </dt>
+            <dd className="inline">{model.label} (<code>{model.model}</code>) — {model.license}</dd>
+          </div>
+        ))}
         {Object.entries(provider.models).map(([modality, model]) => (
           <div key={modality}>
             <dt className="inline font-medium text-text-primary">{modality}: </dt>
@@ -341,6 +347,8 @@ export function ExternalWorkspace() {
   const [prompt, setPrompt] = useState('')
   const [aspect, setAspect] = useState('')
   const [steps, setSteps] = useState(4)
+  const [modelKey, setModelKey] = useState('default')
+  const [size, setSize] = useState('')
   const [resolution, setResolution] = useState('480p')
   const [frames, setFrames] = useState(81)
   const [fps, setFps] = useState(16)
@@ -389,7 +397,16 @@ export function ExternalWorkspace() {
     [status, modality],
   )
   const provider = candidates.find(p => p.id === providerId) || candidates.find(p => p.enabled && p.configured) || candidates[0]
-  const model = provider?.models[modality]
+  const modelOptions = useMemo(() => {
+    if (!provider) return []
+    const base = provider.models[modality]
+    const extra = Object.entries(provider.extra_models || {}).filter(([, m]) => m.modality === modality)
+    return [...(base ? [['default', base] as const] : []), ...extra]
+  }, [provider, modality])
+  const effectiveModelKey = modelOptions.some(([key]) => key === modelKey) ? modelKey : 'default'
+  const model = modelOptions.find(([key]) => key === effectiveModelKey)?.[1]
+  const sizeOptions = (model?.limits.sizes as string[] | undefined) || []
+  const effectiveSize = sizeOptions.includes(size) ? size : sizeOptions[0] || ''
   const aspectOptions = (model?.limits.aspect_ratios as string[] | undefined) || []
   const effectiveAspect = aspectOptions.includes(aspect) ? aspect : aspectOptions[0] || ''
 
@@ -397,11 +414,13 @@ export function ExternalWorkspace() {
     if (!provider) return null
     const out: Record<string, unknown> = { provider: provider.id, modality, prompt }
     if (seed.trim()) out.seed = seed.trim()
-    if (provider.id === 'cloudflare') out.steps = steps
+    if (effectiveModelKey !== 'default') out.model_key = effectiveModelKey
+    if (effectiveSize) out.size = effectiveSize
+    else if (provider.id === 'cloudflare') out.steps = steps
     if (effectiveAspect) out.aspect_ratio = effectiveAspect
     if (modality === 'video') Object.assign(out, { resolution, num_frames: frames, frames_per_second: fps })
     return out
-  }, [provider, modality, prompt, seed, steps, effectiveAspect, resolution, frames, fps])
+  }, [provider, modality, prompt, seed, steps, effectiveAspect, effectiveModelKey, effectiveSize, resolution, frames, fps])
 
   // Any change to the request invalidates a disclosure already shown.
   useEffect(() => {
@@ -517,12 +536,22 @@ export function ExternalWorkspace() {
               >
                 {candidates.map(p => (
                   <option key={p.id} value={p.id}>
-                    {p.label} — {p.models[modality]?.label}
+                    {p.label}
                     {!p.configured ? ' (no key)' : !p.enabled ? ' (disabled)' : ''}
                   </option>
                 ))}
               </select>
             </label>
+            {modelOptions.length > 1 && (
+              <label className="mt-3 grid gap-1 text-[11px] text-text-secondary">
+                Model
+                <select value={effectiveModelKey} onChange={event => setModelKey(event.target.value)} className={inputClass}>
+                  {modelOptions.map(([key, m]) => (
+                    <option key={key} value={key}>{m.label} — {m.license}</option>
+                  ))}
+                </select>
+              </label>
+            )}
             <label className="mt-3 grid gap-1 text-[11px] text-text-secondary">
               Description
               <textarea
@@ -543,7 +572,15 @@ export function ExternalWorkspace() {
                   </select>
                 </label>
               )}
-              {provider?.id === 'cloudflare' && (
+              {sizeOptions.length > 0 && (
+                <label className="grid gap-1 text-[11px] text-text-secondary">
+                  Size
+                  <select value={effectiveSize} onChange={event => setSize(event.target.value)} className={inputClass}>
+                    {sizeOptions.map(option => <option key={option}>{option}</option>)}
+                  </select>
+                </label>
+              )}
+              {provider?.id === 'cloudflare' && sizeOptions.length === 0 && (
                 <label className="grid gap-1 text-[11px] text-text-secondary">
                   Steps (1–8)
                   <input type="number" min={1} max={8} value={steps} onChange={event => setSteps(Number(event.target.value))} className={inputClass} />

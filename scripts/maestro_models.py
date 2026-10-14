@@ -76,7 +76,8 @@ def main(argv=None) -> int:
             return 0
         if args.markdown:
             kinds = {"free_recurring": "gratis", "public_space": "Space", "trial_credits": "prueba",
-                     "free_web": "web gratis", "paid": "pago"}
+                     "free_web": "web gratis", "paid": "pago",
+                     "free_gpu_notebook": "cuaderno GPU gratis"}
             print("| Id | Modelo | Tipo | Licencia | Acceso remoto | Pesos portables (sin NVIDIA) |")
             print("|---|---|---|---|---|---|")
             for item in rows:

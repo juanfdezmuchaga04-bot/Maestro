@@ -60,6 +60,7 @@ __all__ = [
 
 VERIFIED_ON = "2026-10-14"
 REPLICATE_API = "https://api.replicate.com/v1"
+MODELSCOPE_API = "https://api-inference.modelscope.cn/v1"
 CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
 JOBS_FILENAME = "jobs.json"
 CONFIG_FILENAME = "config.json"
@@ -140,6 +141,120 @@ PROVIDERS: dict[str, dict[str, Any]] = {
                 "timeout_s": 120,
             },
         },
+        # Further models of the same provider, chosen with ``model_key``.
+        "extra_models": {
+            "flux2_klein_4b": {
+                "modality": "image",
+                "model": "@cf/black-forest-labs/flux-2-klein-4b",
+                "label": "FLUX.2 [klein] 4B",
+                "license": "Apache-2.0 (Black Forest Labs)",
+                "request": "multipart",
+                "neurons_per_output_tile": 26.05,
+                "limits": {
+                    "prompt_chars": 2048,
+                    "sizes": ["1024x1024", "1280x720", "720x1280", "1024x768", "768x1024", "1536x1024",
+                              "1024x1536"],
+                    "steps": "fixed at 4 by Cloudflare",
+                    "output": "Image as published by Workers AI (base64 JSON)",
+                },
+                "timeout_s": 120,
+                "source": "https://developers.cloudflare.com/workers-ai/models/flux-2-klein-4b/",
+            },
+            "flux2_klein_9b": {
+                "modality": "image",
+                "model": "@cf/black-forest-labs/flux-2-klein-9b",
+                "label": "FLUX.2 [klein] 9B",
+                "license": "FLUX Non-Commercial License (personal / non-commercial use only)",
+                "request": "multipart",
+                "usd_first_mp": 0.015,
+                "usd_extra_mp": 0.002,
+                "limits": {
+                    "prompt_chars": 2048,
+                    "sizes": ["1024x1024", "1280x720", "720x1280", "1024x768", "768x1024", "1536x1024",
+                              "1024x1536"],
+                    "steps": "fixed at 4 by Cloudflare",
+                    "output": "Image as published by Workers AI (base64 JSON)",
+                },
+                "timeout_s": 120,
+                "source": "https://developers.cloudflare.com/workers-ai/models/flux-2-klein-9b/",
+            },
+        },
+    },
+    "modelscope": {
+        "id": "modelscope",
+        "label": "ModelScope API-Inference",
+        "modalities": ["image"],
+        "account": (
+            "A ModelScope account (modelscope.cn) linked to an Alibaba Cloud account that passed real-name "
+            "verification, and a ModelScope access token (not a DashScope key). Verification may not be "
+            "possible for every nationality; this is checked by ModelScope, not by Maestro."
+        ),
+        "credentials": [
+            {"field": "api_token", "label": "ModelScope access token", "secret": True},
+        ],
+        "billing": (
+            "Free API-Inference quota for non-commercial experimentation (reported as 2,000 calls per day, "
+            "reset at 00:00 UTC+8; a September-2026 report shows a balance-based system instead). When it "
+            "is spent the API answers 429."
+        ),
+        "free_quota": "Daily free quota shared by all models (see billing); some models have their own cap",
+        "retention": (
+            "Requests are processed by ModelScope (Alibaba) in mainland China; no retention statement was "
+            "found for API-Inference."
+        ),
+        "cancel": "local_only",
+        "cancel_note": (
+            "API-Inference has no documented cancel call: cancelling stops Maestro polling, the task may "
+            "still finish and count against the quota."
+        ),
+        "docs": [
+            "https://modelscope.cn/docs/model-service/API-Inference/intro",
+            "https://skills.cat/skills/hansonyyds/modelscope-image-gen/modelscope-api",
+        ],
+        "terms": "https://modelscope.cn/protocol/terms",
+        "signup": "https://modelscope.cn/register",
+        "models": {
+            "image": {
+                "model": "Qwen/Qwen-Image",
+                "label": "Qwen-Image 20B",
+                "license": "Apache-2.0 (Qwen)",
+                "limits": {
+                    "prompt_chars": 2000,
+                    "sizes": ["1328x1328", "1664x928", "928x1664", "1472x1104", "1104x1472", "1024x1024"],
+                    "output": "Image URL returned by the task, downloaded by Maestro",
+                },
+                "timeout_s": 300,
+                "poll_s": 5.0,
+            },
+        },
+        "extra_models": {
+            "z_image_turbo": {
+                "modality": "image",
+                "model": "Tongyi-MAI/Z-Image-Turbo",
+                "label": "Z-Image Turbo 6B",
+                "license": "Apache-2.0 (Tongyi-MAI)",
+                "limits": {
+                    "prompt_chars": 2000,
+                    "sizes": ["1024x1024", "1280x720", "720x1280", "1536x1024", "1024x1536", "2048x2048"],
+                    "output": "Image URL returned by the task, downloaded by Maestro",
+                },
+                "timeout_s": 300,
+                "poll_s": 5.0,
+            },
+            "qwen_image_21": {
+                "modality": "image",
+                "model": "Qwen/Qwen-Image-2.1",
+                "label": "Qwen-Image 2.1 7B",
+                "license": "Qwen Research License — non-commercial research/evaluation only",
+                "limits": {
+                    "prompt_chars": 2000,
+                    "sizes": ["1024x1024", "1328x1328", "1664x928", "928x1664"],
+                    "output": "Image URL returned by the task, downloaded by Maestro",
+                },
+                "timeout_s": 300,
+                "poll_s": 5.0,
+            },
+        },
     },
     "replicate": {
         "id": "replicate",
@@ -210,6 +325,34 @@ PROVIDERS: dict[str, dict[str, Any]] = {
 }
 
 
+def model_spec(provider_id: str, modality: str, model_key: str = "") -> tuple[str, dict[str, Any]]:
+    """``(key, spec)`` of a provider's model: the modality default, or one of its ``extra_models``."""
+    provider = PROVIDERS[provider_id]
+    if model_key and model_key != "default":
+        spec = provider.get("extra_models", {}).get(model_key)
+        if not spec or spec.get("modality") != modality:
+            raise ExternalMediaError("invalid_input", f"{provider['label']} has no {modality} model '{model_key}'.")
+        return model_key, spec
+    return "default", provider["models"][modality]
+
+
+def _size(value: Any, allowed: list[str]) -> tuple[int, int]:
+    text = str(value or allowed[0]).lower().replace("×", "x")
+    if text not in allowed:
+        raise ExternalMediaError("invalid_input", f"Size must be one of {', '.join(allowed)}.")
+    width, height = (int(part) for part in text.split("x"))
+    return width, height
+
+
+def _multipart(fields: Mapping[str, Any]) -> tuple[bytes, str]:
+    boundary = "maestro" + uuid.uuid4().hex
+    parts = []
+    for name, value in fields.items():
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+    parts.append(f"--{boundary}--\r\n")
+    return "".join(parts).encode("utf-8"), f"multipart/form-data; boundary={boundary}"
+
+
 # ---------------------------------------------------------------------------
 # Media recognition
 # ---------------------------------------------------------------------------
@@ -243,6 +386,10 @@ def _provider_message(response: HttpResponse) -> str:
     payload = response.json()
     if isinstance(payload, Mapping):
         errors = payload.get("errors")
+        if isinstance(errors, Mapping):
+            errors = [errors]
+        if isinstance(errors, str) and errors.strip():
+            return errors.strip()[:500]
         if isinstance(errors, list) and errors:
             parts = []
             for item in errors[:3]:
@@ -269,6 +416,11 @@ def classify_http(response: HttpResponse, provider_label: str) -> ExternalMediaE
     except ValueError:
         retry_after = None
     client_error = 400 <= status < 500
+    if client_error and any(m in lowered for m in ("real-name", "realname", "real name", "实名", "bind aliyun",
+                                                   "bind your alibaba", "绑定")):
+        return ExternalMediaError(
+            "account_requirement", f"{provider_label} requires an account step first ({status}): {detail}",
+            http_status=status)
     if status == 402 or (client_error and any(marker in lowered for marker in _CREDIT_MARKERS)):
         return ExternalMediaError(
             "insufficient_credit", f"{provider_label} reports no available credit ({status}): {detail}",
@@ -384,7 +536,7 @@ class ExternalMediaManager:
         for job in self._jobs.values():
             if job.get("state") in TERMINAL_STATES:
                 continue
-            if job.get("provider") == "replicate" and job.get("remote_id"):
+            if job.get("provider") in ("replicate", "modelscope") and job.get("remote_id"):
                 job["cancel_requested"] = False
                 job["progress"] = "Maestro restarted; checking the prediction again"
                 resumable.append(job["id"])
@@ -485,6 +637,14 @@ class ExternalMediaManager:
             username = str(account.get("username") or "") if isinstance(account, Mapping) else ""
             return {"ok": True, "message": f"Token accepted for Replicate account '{username or 'unknown'}'.",
                     "note": "This check does not prove there is credit; a job without credit fails with HTTP 402."}
+        if provider_id == "modelscope":
+            token = self._credential("modelscope", "api_token")
+            response = self._request("GET", f"{MODELSCOPE_API}/models", provider_label=spec["label"], timeout=20,
+                                     headers={"Authorization": f"Bearer {token}"})
+            if response.status != 200:
+                raise classify_http(response, spec["label"])
+            return {"ok": True, "message": "ModelScope accepted the token.",
+                    "note": "Real-name binding and the free quota are only proven by a generation."}
         token = self._credential("cloudflare", "api_token")
         self._credential("cloudflare", "account_id")
         response = self._request("GET", f"{CLOUDFLARE_API}/user/tokens/verify", provider_label=spec["label"],
@@ -511,10 +671,12 @@ class ExternalMediaManager:
             raise ExternalMediaError("invalid_input", "Write a description first.")
         if len(prompt) > MAX_PROMPT_CHARS:
             raise ExternalMediaError("invalid_input", f"The description is longer than {MAX_PROMPT_CHARS} characters.")
-        model = spec["models"][modality]
+        model_key, model = model_spec(provider_id, modality, str(params.get("model_key") or ""))
         limits = model["limits"]
         out: dict[str, Any] = {"provider": provider_id, "modality": modality, "prompt": prompt,
                                "model": model["model"]}
+        if model_key != "default":
+            out["model_key"] = model_key
         seed = params.get("seed")
         if seed not in (None, ""):
             try:
@@ -525,6 +687,12 @@ class ExternalMediaManager:
                 raise ExternalMediaError("invalid_input", "Seed must be between 0 and 2147483647.")
         else:
             seed = None
+        if "sizes" in limits:
+            width, height = _size(params.get("size"), limits["sizes"])
+            out.update(width=width, height=height)
+            if seed is not None:
+                out["seed"] = seed
+            return out
         if provider_id == "cloudflare":
             low, high = limits["steps"]
             steps = self._int(params.get("steps"), 4, "Steps")
@@ -567,7 +735,32 @@ class ExternalMediaManager:
 
     def _estimate(self, request: Mapping[str, Any]) -> dict[str, Any]:
         provider_id, modality = request["provider"], request["modality"]
-        model = PROVIDERS[provider_id]["models"][modality]
+        _, model = model_spec(provider_id, modality, request.get("model_key", ""))
+        if provider_id == "modelscope":
+            return {
+                "amount_usd": 0.0, "currency": "USD", "free": True,
+                "summary": "One call of ModelScope's free API-Inference quota (no charge; 429 when the quota is spent).",
+                "basis": "Free API-Inference quota for non-commercial use (reported 2,000 calls/day)",
+                "source": "https://lilting.ch/en/articles/modelscope-api-inference-magicube-probe",
+            }
+        if provider_id == "cloudflare" and model.get("request") == "multipart":
+            tiles = -(-request["width"] // 512) * -(-request["height"] // 512)
+            if "neurons_per_output_tile" in model:
+                neurons = round(tiles * model["neurons_per_output_tile"], 1)
+                basis = f"{model['neurons_per_output_tile']} Neurons per output 512×512 tile × {tiles} tiles"
+            else:
+                megapixels = request["width"] * request["height"] / 1_000_000
+                usd = model["usd_first_mp"] + max(0.0, megapixels - 1) * model["usd_extra_mp"]
+                neurons = round(usd / 0.011 * 1000, 1)
+                basis = (f"${model['usd_first_mp']} for the first megapixel + ${model['usd_extra_mp']} per extra "
+                         f"megapixel, converted at $0.011 per 1,000 Neurons")
+            per_day = int(10000 // neurons) if neurons else 0
+            return {
+                "amount_usd": round(neurons * 0.011 / 1000, 5), "currency": "USD", "neurons": neurons, "free": True,
+                "summary": (f"≈ {neurons} Neurons of the 10,000 free daily Neurons (≈ {per_day} such images a day). "
+                            "No charge on the Free plan."),
+                "basis": basis, "source": model.get("source", "https://developers.cloudflare.com/workers-ai/platform/pricing/"),
+            }
         if provider_id == "cloudflare":
             # Pricing page: 4.80 Neurons per 512×512 tile and 9.60 Neurons per step.
             neurons = round(4 * 4.80 + request["steps"] * 9.60, 1)
@@ -598,11 +791,11 @@ class ExternalMediaManager:
     def quote(self, params: Mapping[str, Any]) -> dict[str, Any]:
         request = self.normalise(params)
         spec = PROVIDERS[request["provider"]]
-        model = spec["models"][request["modality"]]
+        _, model = model_spec(request["provider"], request["modality"], request.get("model_key", ""))
         sent = [f"Description text ({len(request['prompt'])} characters)"]
         for key, label in (("aspect_ratio", "aspect ratio"), ("resolution", "resolution"),
                            ("num_frames", "frame count"), ("frames_per_second", "frame rate"),
-                           ("steps", "steps"), ("seed", "seed")):
+                           ("width", "width"), ("height", "height"), ("steps", "steps"), ("seed", "seed")):
             if key in request:
                 sent.append(f"{label}: {request[key]}")
         sent.append("Your API key (as the request's authorization header)")
@@ -613,7 +806,8 @@ class ExternalMediaManager:
             "model_label": model["label"],
             "model_license": model.get("license", ""),
             "modality": request["modality"],
-            "endpoint_host": "api.replicate.com" if request["provider"] == "replicate" else "api.cloudflare.com",
+            "endpoint_host": {"replicate": "api.replicate.com", "cloudflare": "api.cloudflare.com",
+                              "modelscope": "api-inference.modelscope.cn"}[request["provider"]],
             "data_sent": sent,
             "not_sent": "No files, images, audio, other prompts or gallery content are sent.",
             "cost": self._estimate(request),
@@ -764,6 +958,8 @@ class ExternalMediaManager:
                 raise ExternalMediaError("provider_disabled", f"{job['provider_label']} was disabled.")
             if job["provider"] == "cloudflare":
                 body, remote_note = self._run_cloudflare(job, event)
+            elif job["provider"] == "modelscope":
+                body, remote_note = self._run_modelscope(job, event)
             else:
                 body, remote_note = self._run_replicate(job, event)
             if body is None:
@@ -781,18 +977,26 @@ class ExternalMediaManager:
     def _run_cloudflare(self, job: dict[str, Any], event: threading.Event) -> tuple[Optional[bytes], str]:
         request = job["request"]
         spec = PROVIDERS["cloudflare"]
-        model = spec["models"]["image"]
+        _, model = model_spec("cloudflare", "image", request.get("model_key", ""))
         token = self._credential("cloudflare", "api_token")
         account = self._credential("cloudflare", "account_id")
-        payload: dict[str, Any] = {"prompt": request["prompt"], "steps": request["steps"]}
-        if "seed" in request:
-            payload["seed"] = request["seed"]
-        self._update(job, state="running", progress="Sent to Cloudflare Workers AI; waiting for the image")
+        if model.get("request") == "multipart":
+            # FLUX.2 models on Workers AI take multipart form data, even for a plain prompt.
+            fields: dict[str, Any] = {"prompt": request["prompt"], "width": request["width"],
+                                      "height": request["height"]}
+            if "seed" in request:
+                fields["seed"] = request["seed"]
+            data, content_type = _multipart(fields)
+        else:
+            payload: dict[str, Any] = {"prompt": request["prompt"], "steps": request["steps"]}
+            if "seed" in request:
+                payload["seed"] = request["seed"]
+            data, content_type = json.dumps(payload).encode("utf-8"), "application/json"
+        self._update(job, state="running", progress=f"Sent to Cloudflare Workers AI ({model['label']}); waiting")
         response = self._request(
             "POST", f"{CLOUDFLARE_API}/accounts/{account}/ai/run/{model['model']}",
-            provider_label=spec["label"], timeout=model["timeout_s"],
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            provider_label=spec["label"], timeout=model["timeout_s"], data=data,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": content_type},
         )
         if event.is_set() or job.get("cancel_requested"):
             return None, ("Cancelled in Maestro. Cloudflare had already received the request, so it may have "
@@ -813,6 +1017,76 @@ class ExternalMediaManager:
             return base64.b64decode(image, validate=True), ""
         except (ValueError, TypeError) as exc:
             raise ExternalMediaError("invalid_output", "Cloudflare's image was not valid base64.") from exc
+
+    # ModelScope API-Inference: an asynchronous task, polled until it has an image URL.
+    def _run_modelscope(self, job: dict[str, Any], event: threading.Event) -> tuple[Optional[bytes], str]:
+        request = job["request"]
+        spec = PROVIDERS["modelscope"]
+        label = spec["label"]
+        _, model = model_spec("modelscope", "image", request.get("model_key", ""))
+        token = self._credential("modelscope", "api_token")
+        auth = {"Authorization": f"Bearer {token}"}
+        if not job.get("remote_id"):
+            payload: dict[str, Any] = {"model": model["model"], "prompt": request["prompt"],
+                                       "size": f"{request['width']}x{request['height']}"}
+            if "seed" in request:
+                payload["seed"] = request["seed"]
+            self._update(job, state="submitting", progress=f"Creating the task on ModelScope ({model['label']})")
+            response = self._request(
+                "POST", f"{MODELSCOPE_API}/images/generations", provider_label=label, timeout=60,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={**auth, "Content-Type": "application/json", "X-ModelScope-Async-Mode": "true"},
+            )
+            if response.status != 200:
+                raise classify_http(response, label)
+            task = response.json()
+            task_id = str(task.get("task_id") or "") if isinstance(task, Mapping) else ""
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]{4,128}", task_id):
+                raise ExternalMediaError("invalid_output", "ModelScope did not return a task id.")
+            self._update(job, remote_id=task_id, state="running", progress=f"Task {task_id} queued on ModelScope")
+        task_id = job["remote_id"]
+        deadline = self._clock() + float(model["timeout_s"])
+        poll = float(model.get("poll_s", 5.0))
+        failures = 0
+        while True:
+            if event.is_set() or job.get("cancel_requested"):
+                return None, ("Cancelled in Maestro. ModelScope has no cancel call, so the task may still finish "
+                              "and count against the free quota.")
+            if self._clock() > deadline:
+                raise ExternalMediaError("timeout", f"ModelScope did not finish within {int(model['timeout_s'])} s.")
+            try:
+                response = self._request("GET", f"{MODELSCOPE_API}/tasks/{task_id}", provider_label=label, timeout=30,
+                                         headers={**auth, "X-ModelScope-Task-Type": "image_generation"})
+            except ExternalMediaError:
+                failures += 1
+                if failures >= 5:
+                    raise
+                event.wait(poll)
+                continue
+            if response.status != 200:
+                error = classify_http(response, label)
+                if error.code in ("provider_unavailable", "rate_limited") and failures < 5:
+                    failures += 1
+                    event.wait(max(poll, error.retry_after or 0))
+                    continue
+                raise error
+            failures = 0
+            task = response.json()
+            status = str(task.get("task_status") or "").upper() if isinstance(task, Mapping) else ""
+            if status == "SUCCEED":
+                images = task.get("output_images") or []
+                url = next((u for u in images if isinstance(u, str) and u.startswith("https://")), "")
+                if not url:
+                    raise ExternalMediaError("invalid_output", "ModelScope reported success without an image URL.")
+                self._update(job, state="downloading", progress="Downloading the image from ModelScope")
+                return self._download(url, label), ""
+            if status in ("FAILED", "FAILURE", "CANCELED", "CANCELLED"):
+                detail = task.get("errors") or task.get("message") or task.get("error") or "no reason given"
+                raise ExternalMediaError("provider_failed", f"ModelScope reports the task failed: {detail}")
+            progress = f"ModelScope: {status.lower() or 'waiting'}"
+            if progress != job.get("progress"):
+                self._update(job, progress=progress, state="running")
+            event.wait(poll)
 
     # Replicate: create a prediction, poll it, cancel it remotely when asked.
     def _run_replicate(self, job: dict[str, Any], event: threading.Event) -> tuple[Optional[bytes], str]:

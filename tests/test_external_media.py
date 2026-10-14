@@ -548,6 +548,101 @@ class ReplicateTests(Base):
         self.assertEqual(ctx.exception.code, "auth_failed")
 
 
+class NewModelTests(Base):
+    KLEIN = {"provider": "cloudflare", "modality": "image", "prompt": "a red bicycle", "model_key": "flux2_klein_4b",
+             "size": "1280x720", "seed": 3}
+    QWEN = {"provider": "modelscope", "modality": "image", "prompt": "a tea house", "size": "1328x1328"}
+    ZIMG = {"provider": "modelscope", "modality": "image", "prompt": "a tea house", "model_key": "z_image_turbo",
+            "size": "1024x1024"}
+
+    def setUp(self):
+        super().setUp()
+        self._ms = mock.patch.dict(em.PROVIDERS["modelscope"]["models"]["image"], {"poll_s": 0.01})
+        self._ms.start()
+        self._zi = mock.patch.dict(em.PROVIDERS["modelscope"]["extra_models"]["z_image_turbo"], {"poll_s": 0.01})
+        self._zi.start()
+
+    def tearDown(self):
+        self._ms.stop()
+        self._zi.stop()
+        super().tearDown()
+
+    def ready_ms(self, m):
+        m.set_credentials("modelscope", {"api_token": "ms-secret-token-1234"})
+        m.set_enabled("modelscope", True)
+
+    def test_klein_uses_multipart_and_reports_neurons(self):
+        self.transport.on("POST", "/ai/run/@cf/black-forest-labs/flux-2-klein-4b",
+                          ok_json({"success": True, "result": {"image": base64.b64encode(PNG).decode()}}))
+        m = self.manager()
+        self.ready(m, "cloudflare")
+        quote = m.quote(self.KLEIN)
+        self.assertEqual(quote["disclosure"]["model"], "@cf/black-forest-labs/flux-2-klein-4b")
+        self.assertEqual(quote["disclosure"]["cost"]["neurons"], round(6 * 26.05, 1))
+        job = self.submit(m, self.KLEIN)
+        self.assertEqual(job["state"], "succeeded", job)
+        call = self.transport.calls[0]
+        self.assertTrue(call["headers"]["Content-Type"].startswith("multipart/form-data; boundary="))
+        body = call["data"].decode()
+        self.assertIn('name="prompt"\r\n\r\na red bicycle', body)
+        self.assertIn('name="width"\r\n\r\n1280', body)
+        self.assertNotIn('name="steps"', body)
+
+    def test_klein_9b_cost_and_licence_disclosed(self):
+        m = self.manager(start_threads=False)
+        d = m.quote(dict(self.KLEIN, model_key="flux2_klein_9b", size="1024x1024"))["disclosure"]
+        self.assertIn("Non-Commercial", d["model_license"])
+        self.assertGreater(d["cost"]["neurons"], 1000)
+        with self.assertRaises(em.ExternalMediaError):
+            m.quote(dict(self.KLEIN, model_key="no_such_model"))
+        with self.assertRaises(em.ExternalMediaError):
+            m.quote(dict(self.KLEIN, size="4000x4000"))
+
+    def test_modelscope_task_success(self):
+        (self.transport
+         .on("POST", "/v1/images/generations", ok_json({"task_id": "task-123"}))
+         .on("GET", "/v1/tasks/task-123", ok_json({"task_status": "RUNNING"}),
+             ok_json({"task_status": "SUCCEED", "output_images": ["https://muse-ai.oss-cn-hangzhou.aliyuncs.com/a.png"]}))
+         .on("GET", "aliyuncs.com", HttpResponse(200, {}, PNG)))
+        m = self.manager()
+        self.ready_ms(m)
+        job = self.submit(m, self.ZIMG)
+        self.assertEqual(job["state"], "succeeded", job)
+        post = self.transport.calls[0]
+        self.assertEqual(post["headers"]["X-ModelScope-Async-Mode"], "true")
+        self.assertEqual(json.loads(post["data"]), {"model": "Tongyi-MAI/Z-Image-Turbo", "prompt": "a tea house",
+                                                    "size": "1024x1024"})
+        poll = self.transport.called("GET", "/v1/tasks/")[0]
+        self.assertEqual(poll["headers"]["X-ModelScope-Task-Type"], "image_generation")
+        self.assertTrue(job["disclosure"]["cost"]["free"])
+
+    def test_modelscope_failures(self):
+        cases = [
+            (HttpResponse(429, {}, json.dumps({"errors": {"message": "quota exceeded for today"}}).encode()),
+             "quota_exhausted"),
+            (HttpResponse(401, {}, b'{"message": "invalid token"}'), "auth_failed"),
+            (HttpResponse(400, {}, json.dumps({"message": "Please bind your Alibaba Cloud account and complete "
+                                                          "real-name verification"}).encode()),
+             "account_requirement"),
+        ]
+        for answer, code in cases:
+            with self.subTest(code=code):
+                self.transport.routes.clear()
+                self.transport.on("POST", "/v1/images/generations", answer)
+                m = self.manager()
+                self.ready_ms(m)
+                job = self.submit(m, self.QWEN)
+                self.assertEqual(job["error"]["code"], code)
+        self.transport.routes.clear()
+        (self.transport.on("POST", "/v1/images/generations", ok_json({"task_id": "task-9"}))
+         .on("GET", "/v1/tasks/task-9", ok_json({"task_status": "FAILED", "errors": "content policy"})))
+        m = self.manager()
+        self.ready_ms(m)
+        job = self.submit(m, self.QWEN)
+        self.assertEqual(job["error"]["code"], "provider_failed")
+        self.assertIn("content policy", job["error"]["message"])
+
+
 # ---------------------------------------------------------------------------
 # HTTP surface
 # ---------------------------------------------------------------------------

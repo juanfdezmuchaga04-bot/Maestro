@@ -8,6 +8,15 @@ pipeline's own history lives in [app/docs/CHANGELOG.md](app/docs/CHANGELOG.md).
 Production readiness for driving Maestro from a phone, free public compute for
 machines with no GPU, and an integrity fix for cached model receipts.
 
+- **More free cloud image models.** The Cloud mode adds FLUX.2 [klein] 4B and 9B on
+  Cloudflare Workers AI (multipart requests, cost shown in Neurons per output tile;
+  the 9B's non-commercial licence is in the disclosure) and a new opt-in provider,
+  ModelScope API-Inference, for Qwen-Image 20B, Z-Image Turbo and Qwen-Image 2.1 on
+  its free quota (asynchronous tasks, polled until an image URL is returned). A
+  provider can now offer several models per modality (`model_key`) and a size; a
+  ModelScope account that still needs real-name verification fails as
+  `account_requirement`. Not yet exercised against the live services.
+
 - **Model library: every model, every way to reach it, downloads on any computer.**
   `app/services/model_manifest.json` lists all 211 model definitions, 11 LLMs,
   MMAudio and Whisper with every file they need — including the text encoders,

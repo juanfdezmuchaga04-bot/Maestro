@@ -38,6 +38,7 @@ export interface ExternalProviderInfo {
   terms: string
   signup: string
   models: Partial<Record<ExternalModality, ExternalModelInfo>>
+  extra_models?: Record<string, ExternalModelInfo & { modality: ExternalModality }>
   credentials: ExternalCredentialInfo[]
   enabled: boolean
   configured: boolean

@@ -27,6 +27,7 @@ _STATUS = {
     "timeout": 504,
     "network_error": 502,
     "provider_unavailable": 503,
+    "account_requirement": 403,
 }
 
 
