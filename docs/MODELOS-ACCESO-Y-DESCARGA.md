@@ -165,7 +165,7 @@ tener una NVIDIA es ejecutar ese motor en una NVIDIA de otro sitio. Maestro ya d
 renders en otro Maestro (*peer*, ver [STUDIO-NODES.md](STUDIO-NODES.md)); el **nodo GPU
 gratuito** convierte una sesión gratuita de cuaderno en ese peer.
 
-1. Maestro → **Models → Free NVIDIA GPU** → descarga `maestro_free_gpu_node.ipynb`
+1. Maestro → **Auto → Free NVIDIA GPU** → descarga `maestro_free_gpu_node.ipynb`
    (también en `cloud/` del repositorio).
 2. Kaggle → *Create → Notebook → File → Import notebook*. *Settings → Accelerator →
    GPU T4 ×2* e *Internet → On* (cuenta verificada por teléfono).

@@ -34,6 +34,7 @@ def fresh_routes():
     namespace = {
         'Request': JsonRequest, 'HTTPException': RuntimeError, 'traceback': traceback,
         'wgp': engine, '_pipeline_initialized': False, '_jobs': {}, '_run_generation': None,
+        '_run_director_generation': None,
         '_gen_lock': None, '_active_gen_states': {}, '_on_director_pipeline_terminal': None,
         '_on_director_queue_terminal': None,
     }

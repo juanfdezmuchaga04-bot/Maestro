@@ -12,7 +12,7 @@ own engine produced.  Free notebook platforms lend an NVIDIA GPU for hours a wee
 ``scripts/maestro_cloud_node.py`` turns such a session into a peer: it installs
 Maestro with a PyTorch build that matches the driver, starts it in token mode,
 opens a TryCloudflare tunnel and prints a **connection code**.  Pasting that code
-into Maestro on the laptop (Models → Free NVIDIA GPU) registers the peer, so Studio
+into Maestro on the laptop (Auto → Free NVIDIA GPU) registers the peer, so Studio
 and Films renders run there with the real pipeline and come back as files.
 
 This module holds the parts both sides share and that can be tested anywhere:
@@ -25,12 +25,30 @@ from __future__ import annotations
 import base64
 import json
 import re
-from typing import Any, Mapping, Optional, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
-__all__ = ["CloudNodeError", "PLATFORMS", "parse_gpus", "driver_cuda", "choose_torch", "pick_storage",
-           "tunnel_url", "make_code", "parse_code", "PEER_ID"]
+__all__ = [
+    "MAX_NODES",
+    "PEER_ID",
+    "PLATFORMS",
+    "CloudNodeError",
+    "choose_torch",
+    "driver_cuda",
+    "gpu_memory_gb",
+    "make_code",
+    "make_multi_code",
+    "parse_code",
+    "parse_gpus",
+    "parse_nodes",
+    "peer_id_for",
+    "pick_storage",
+    "tunnel_url",
+]
 
 PEER_ID = "free-gpu"
+# One Maestro per GPU: a Kaggle "T4 x2" session runs two independent nodes.
+MAX_NODES = 2
 CODE_PREFIX = "maestro-node:"
 TUNNEL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 
@@ -83,13 +101,13 @@ def parse_gpus(csv_text: str) -> list[dict[str, Any]]:
     return gpus
 
 
-def driver_cuda(smi_text: str) -> Optional[tuple[int, int]]:
+def driver_cuda(smi_text: str) -> tuple[int, int] | None:
     """The highest CUDA version the installed driver supports, from plain ``nvidia-smi``."""
     match = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", smi_text or "")
     return (int(match.group(1)), int(match.group(2))) if match else None
 
 
-def choose_torch(cuda: Optional[tuple[int, int]], compute_capability: float) -> dict[str, Any]:
+def choose_torch(cuda: tuple[int, int] | None, compute_capability: float) -> dict[str, Any]:
     """The PyTorch build Maestro's launcher uses that this driver and GPU can run.
 
     Maestro's preferred runtime is torch 2.10 on CUDA 13 (driver ≥ 580); the legacy
@@ -130,7 +148,31 @@ def make_code(url: str, token: str, *, label: str, gpu: str = "", expires_hint: 
     return CODE_PREFIX + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def parse_code(code: str) -> dict[str, Any]:
+def make_multi_code(nodes: Sequence[Mapping[str, str]], *, expires_hint: str = "") -> str:
+    """One code for every node of a session (version 2: a list of nodes)."""
+    if not nodes:
+        raise CloudNodeError("A node code needs at least one node.")
+    if len(nodes) == 1:
+        node = nodes[0]
+        return make_code(str(node["url"]), str(node["token"]), label=str(node.get("label") or ""),
+                         gpu=str(node.get("gpu") or ""), expires_hint=expires_hint)
+    payload = {"v": 2, "expires": expires_hint,
+               "nodes": [{"url": str(n["url"]), "token": str(n["token"]), "label": str(n.get("label") or ""),
+                          "gpu": str(n.get("gpu") or "")} for n in nodes[:MAX_NODES]]}
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return CODE_PREFIX + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _clean_node(data: Mapping[str, Any], expires: str) -> dict[str, Any]:
+    url, token = str(data.get("url") or ""), str(data.get("token") or "")
+    if not url.startswith("https://") or len(token) < 24:
+        raise CloudNodeError("The node code has no usable address or token.")
+    return {"url": url.rstrip("/"), "token": token, "label": str(data.get("label") or "Free GPU node")[:120],
+            "gpu": str(data.get("gpu") or "")[:200], "expires": str(expires or "")[:200]}
+
+
+def parse_nodes(code: str) -> list[dict[str, Any]]:
+    """Every node a code describes (one for a v1 code, up to ``MAX_NODES`` for v2)."""
     text = str(code or "").strip()
     if not text.startswith(CODE_PREFIX):
         raise CloudNodeError("This is not a Maestro node code (it starts with 'maestro-node:').")
@@ -139,10 +181,27 @@ def parse_code(code: str) -> dict[str, Any]:
         data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
         raise CloudNodeError("The node code is damaged; copy it again from the notebook output.") from exc
-    if not isinstance(data, dict) or data.get("v") != 1:
+    if not isinstance(data, dict) or data.get("v") not in (1, 2):
         raise CloudNodeError("Unsupported node code version.")
-    url, token = str(data.get("url") or ""), str(data.get("token") or "")
-    if not url.startswith("https://") or len(token) < 24:
-        raise CloudNodeError("The node code has no usable address or token.")
-    return {"url": url.rstrip("/"), "token": token, "label": str(data.get("label") or "Free GPU node")[:120],
-            "gpu": str(data.get("gpu") or "")[:200], "expires": str(data.get("expires") or "")[:200]}
+    if data["v"] == 1:
+        return [_clean_node(data, str(data.get("expires") or ""))]
+    nodes = data.get("nodes")
+    if not isinstance(nodes, list) or not nodes or not all(isinstance(n, dict) for n in nodes):
+        raise CloudNodeError("The node code lists no nodes.")
+    return [_clean_node(node, str(data.get("expires") or "")) for node in nodes[:MAX_NODES]]
+
+
+def parse_code(code: str) -> dict[str, Any]:
+    """The first node of a code (kept for callers that handle a single node)."""
+    return parse_nodes(code)[0]
+
+
+def peer_id_for(index: int) -> str:
+    """``free-gpu`` for the first node, ``free-gpu-2`` for the second."""
+    return PEER_ID if int(index) <= 0 else f"{PEER_ID}-{int(index) + 1}"
+
+
+def gpu_memory_gb(text: str) -> float:
+    """GPU memory from a node's description (``"Tesla T4 15360 MiB"`` → 15.0); 0 if absent."""
+    match = re.search(r"(\d{3,6})\s*MiB", str(text or ""))
+    return round(int(match.group(1)) / 1024, 1) if match else 0.0

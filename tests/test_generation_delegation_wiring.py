@@ -43,6 +43,7 @@ _HELPERS = (
     "_delegation_out_dir",
     "_generation_queue_task",
     "_delegated_queue_payload",
+    "_delegated_peer_load",
 )
 _CONSTANTS = ("_DELEGATION_POLL_SECONDS", "_DELEGATION_PHASES")
 
@@ -126,6 +127,7 @@ def load_helpers(
         "remote_engine_service": _PeersStub(peers),
         "public_cloud_service": _PublicCloudStub(list(public_sources or [])),
         "_remote_peers_root": lambda: "/nonexistent/peers",
+        "_jobs": {},
         "_public_cloud_root": lambda: "/nonexistent/public",
         "_workspace_dir": lambda workspace="": os.path.join(workspace_root, workspace or "default"),
     }
@@ -285,6 +287,21 @@ class DelegatedPayloadTests(unittest.TestCase):
         # A public Space has no Maestro engine to ask for, so none is named: the job
         # names the capability and the runner maps it onto that Space's own inputs.
         self.assertNotIn("remote_engine", payload["params"])
+
+    def test_a_job_that_names_its_peer_engine_keeps_it(self):
+        job = {"id": "f1", "params": {"video_guide": "/v.mp4", "remote_engine": engine_routing.FINISH_ENGINE}}
+        route = {"engine": "node:free-gpu", "peer_id": "free-gpu", "remote_engine": engine_routing.REMOTE_ENGINE}
+        payload = self.helpers["_delegated_queue_payload"](job, route)
+        self.assertEqual(payload["params"]["remote_engine"], engine_routing.FINISH_ENGINE)
+
+    def test_two_running_jobs_on_one_node_count_as_its_load(self):
+        jobs = self.helpers["_jobs"]
+        route = {"target": engine_routing.REMOTE_TARGET, "peer_id": "free-gpu"}
+        jobs.update({"a": {"status": "running", "_generation_route": route},
+                     "b": {"status": "queued", "_generation_route": route},
+                     "c": {"status": "completed", "_generation_route": route}})
+        self.assertEqual(self.helpers["_delegated_peer_load"](), {"free-gpu": 2})
+        jobs.clear()
 
     def test_the_payload_names_the_peer_engine_and_keeps_the_studio_params(self):
         job = {

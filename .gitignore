@@ -124,3 +124,6 @@ docs/development/*
 
 # Free GPU node (scripts/maestro_cloud_node.py) isolated environment
 .node-venv/
+
+# SeedVR2 upscaler checkout (fetched at a pinned commit on first use)
+app/tools/seedvr2/

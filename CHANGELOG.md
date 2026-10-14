@@ -8,12 +8,31 @@ pipeline's own history lives in [app/docs/CHANGELOG.md](app/docs/CHANGELOG.md).
 Production readiness for driving Maestro from a phone, free public compute for
 machines with no GPU, and an integrity fix for cached model receipts.
 
+- **Automatic production.** **Auto → Auto production** turns a description and a
+  few images into a finished video with no step-by-step review: it checks for an
+  NVIDIA GPU (local or connected nodes), picks a recipe for 720p/1080p/1440p/4K
+  (FlashVSR inside the render, optional RIFE ×2, SeedVR2 for 4K), runs a Director
+  `short_film_story` pipeline in auto mode sized for the render GPU
+  (`render_hardware`), and on a computer without a GPU sends every render to the
+  least busy node. API: `/api/v1/auto-production`. Director renders now also route
+  to peers, and multi-clip media (soundtrack, voice, per-clip keyframes) travel
+  with the job. Tested with simulated engines; not yet run end to end on a GPU.
+  See [docs/PRODUCCION-AUTOMATICA.md](docs/PRODUCCION-AUTOMATICA.md).
+
+- **Two free nodes per Kaggle session and SeedVR2 4K finishing.** With "GPU T4 ×2"
+  the node script starts one Maestro per GPU (own port, token, tunnel and git
+  worktree; shared model folder) and prints one v2 code that connects both as
+  `free-gpu` and `free-gpu-2`; `--nodes 1` keeps one. Every Maestro registers the
+  `maestro-finish` queue engine, which upscales a video with SeedVR2 (Apache-2.0,
+  pinned commit, GGUF weights with BlockSwap and tiled VAE chosen by VRAM) and puts
+  the original audio back. Not yet measured on a T4.
+
 - **Free NVIDIA GPU node.** `scripts/maestro_cloud_node.py` and
   `cloud/maestro_free_gpu_node.ipynb` turn a free Kaggle (T4 ×2, ≈ 30 GPU-hours a
   week) or Lightning AI notebook session into a peer that runs this same Maestro:
   an isolated Python 3.11 environment with the PyTorch build the driver supports,
   Maestro in token mode on 127.0.0.1, a TryCloudflare HTTPS tunnel and a
-  `maestro-node:` connection code. **Models → Free NVIDIA GPU** downloads the
+  `maestro-node:` connection code. **Auto → Free NVIDIA GPU** downloads the
   notebook and connects the code (`POST /api/v1/engines/free-gpu/connect`), which
   registers peer `free-gpu` with engine `maestro`, probes it and starts the local
   queue, so Studio and Films renders run on the real pipeline there. Google Colab's

@@ -5,9 +5,10 @@ Run it from a clone of this repository inside the notebook:
 
     python scripts/maestro_cloud_node.py                  # install, start, tunnel, print the code
     python scripts/maestro_cloud_node.py --check          # only report GPU / driver / disk, change nothing
+    python scripts/maestro_cloud_node.py --nodes 1        # one node even on a 2-GPU session
 
 It prints a ``maestro-node:…`` connection code.  Paste it into Maestro on your own
-computer (Models → Free NVIDIA GPU → Connect).  From then on Studio and Films send
+computer (Auto → Free NVIDIA GPU → Connect).  From then on Studio and Films send
 renders to this session, which runs Maestro's real engine on the NVIDIA GPU, and
 the finished files come back to your computer.
 
@@ -21,6 +22,13 @@ Steps (each one printed as it happens, each one idempotent on a re-run):
 5. open a TryCloudflare tunnel (HTTPS, no account) to it;
 6. start the node's queue worker and print the connection code;
 7. stay in the foreground, reporting GPU use, until the session ends or you stop it.
+
+With two GPUs (Kaggle "GPU T4 x2") it starts **two** independent Maestro nodes, one
+per GPU (``CUDA_VISIBLE_DEVICES``), each with its own port, token and tunnel, and
+prints one code that connects both.  The second node runs from a ``git worktree``
+of this checkout so the two never share settings or queue files; the model folder
+is shared, so weights are downloaded once.  Both share the session's system RAM
+(about 29 GB on Kaggle): use models that fit in half of it, or ``--nodes 1``.
 
 Nothing here works around a platform's quota or terms: the session is yours, runs
 only while you keep it open, and stops when the platform stops it.
@@ -47,6 +55,7 @@ from services import cloud_node  # noqa: E402
 
 VENV = os.path.join(ROOT, ".node-venv")
 PORT = 7860
+SECOND_TREE = os.path.join(os.path.dirname(ROOT), "maestro-node-2")
 CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
 
 
@@ -104,10 +113,10 @@ def ensure_environment(torch: dict) -> str:
     return python
 
 
-def place_storage(storage: str) -> None:
+def place_storage(storage: str, app: str = APP) -> None:
     target = os.path.join(storage, "maestro-ckpts")
     os.makedirs(target, exist_ok=True)
-    link = os.path.join(APP, "ckpts")
+    link = os.path.join(app, "ckpts")
     if os.path.islink(link) or not os.path.exists(link):
         if os.path.islink(link):
             os.unlink(link)
@@ -132,13 +141,13 @@ def wait_for(url: str, token: str, timeout: float) -> bool:
     return False
 
 
-def start_tunnel(storage: str) -> tuple[subprocess.Popen, str]:
+def start_tunnel(storage: str, port: int = PORT) -> tuple[subprocess.Popen, str]:
     binary = shutil.which("cloudflared") or os.path.join(storage, "cloudflared")
     if not os.path.isfile(binary):
         log("Downloading cloudflared (Cloudflare's tunnel client)…")
         urllib.request.urlretrieve(CLOUDFLARED_URL, binary)
         os.chmod(binary, 0o755)
-    process = subprocess.Popen([binary, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{PORT}"],
+    process = subprocess.Popen([binary, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     deadline = time.time() + 90
     while time.time() < deadline and process.stdout is not None:
@@ -151,12 +160,54 @@ def start_tunnel(storage: str) -> tuple[subprocess.Popen, str]:
                                     "Is internet access enabled for this notebook?")
 
 
+def system_ram_gb() -> float:
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / 1024 / 1024
+    except OSError:
+        pass
+    return 0.0
+
+
+def second_tree() -> str:
+    """A git worktree of this checkout for the second node (separate settings and queue)."""
+    if not os.path.isdir(SECOND_TREE):
+        run(["git", "-C", ROOT, "worktree", "add", "--detach", SECOND_TREE, "HEAD"])
+    return os.path.join(SECOND_TREE, "app")
+
+
+def start_node(index: int, app: str, gpu_index: int, port: int, token: str, python: str, storage: str,
+               timeout: float) -> tuple[subprocess.Popen, subprocess.Popen, str, str]:
+    """Start one Maestro on one GPU, wait for it, tunnel it and start its queue worker."""
+    env = {**os.environ, "MAESTRO_ACCESS_TOKEN": token, "SERVER_NAME": "127.0.0.1", "SERVER_PORT": str(port),
+           "PYTHONUNBUFFERED": "1", "CUDA_VISIBLE_DEVICES": str(gpu_index)}
+    log_path = os.path.join(storage, f"maestro-node-{index + 1}.log")
+    log(f"Starting node {index + 1} on GPU {gpu_index}, port {port} (log: {log_path}). "
+        "The first start imports the engine and can take several minutes.")
+    server = subprocess.Popen([python, "launch.py"], cwd=app, env=env,
+                              stdout=open(log_path, "a", encoding="utf-8"), stderr=subprocess.STDOUT)
+    if not wait_for(f"http://127.0.0.1:{port}/api/v1/engines", token, timeout):
+        server.terminate()
+        raise cloud_node.CloudNodeError(f"Node {index + 1} did not answer within {int(timeout)} s; "
+                                        f"see the end of {log_path}.")
+    tunnel, url = start_tunnel(storage, port)
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/api/v1/production/queue/worker/start", data=b"{}",
+                                     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                                     method="POST")
+    urllib.request.urlopen(request, timeout=30).close()
+    return server, tunnel, url, log_path
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--check", action="store_true", help="only measure and report")
     parser.add_argument("--token", default=os.environ.get("MAESTRO_ACCESS_TOKEN", ""),
                         help="reuse a fixed token (default: a new random one per session)")
     parser.add_argument("--startup-timeout", type=float, default=1800)
+    parser.add_argument("--nodes", default="auto", choices=["auto", "1", "2"],
+                        help="how many Maestro nodes to run (auto: one per GPU, at most 2)")
     args = parser.parse_args(argv)
 
     if platform.system() != "Linux":
@@ -181,55 +232,73 @@ def main(argv=None) -> int:
     if args.check:
         return 0
 
+    count = min(len(info["gpus"]), cloud_node.MAX_NODES) if args.nodes == "auto" else int(args.nodes)
+    if count > len(info["gpus"]):
+        log(f"Asked for {count} nodes but this session has {len(info['gpus'])} GPU; running 1.")
+        count = 1
+    ram = system_ram_gb()
+    if count > 1:
+        log(f"Two nodes share {ram:.0f} GB of system RAM. Models that offload to RAM (14B, BlockSwap) can run "
+            "out of memory with two at once; if a node dies, re-run with --nodes 1.")
+
     python = ensure_environment(torch)
     place_storage(info["storage"])
-    token = args.token or secrets.token_urlsafe(32)
-    env = {**os.environ, "MAESTRO_ACCESS_TOKEN": token, "SERVER_NAME": "127.0.0.1", "SERVER_PORT": str(PORT),
-           "PYTHONUNBUFFERED": "1"}
-    log_path = os.path.join(info["storage"], "maestro-node.log")
-    log(f"Starting Maestro (log: {log_path}). The first start imports the engine and can take several minutes.")
-    server = subprocess.Popen([python, "launch.py"], cwd=APP, env=env,
-                              stdout=open(log_path, "a", encoding="utf-8"), stderr=subprocess.STDOUT)
-    if not wait_for(f"http://127.0.0.1:{PORT}/api/v1/engines", token, args.startup_timeout):
-        log(f"Maestro did not answer within {int(args.startup_timeout)} s; see the end of {log_path}.")
-        server.terminate()
-        return 1
-    tunnel, url = start_tunnel(info["storage"])
-    request = urllib.request.Request(f"http://127.0.0.1:{PORT}/api/v1/production/queue/worker/start", data=b"{}",
-                                     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                                     method="POST")
-    urllib.request.urlopen(request, timeout=30).close()
-    label = {"kaggle": "Kaggle", "lightning": "Lightning AI"}.get(info["platform"], "Cloud") + f" {gpu['name']}"
-    code = cloud_node.make_code(url, token, label=label, gpu=f"{gpu['name']} {gpu['memory_mb']} MiB",
-                                expires_hint="until this notebook session ends")
-    with open(os.path.join(info["storage"], "maestro-connection-code.txt"), "w", encoding="utf-8") as handle:
-        handle.write(code + "\n")
-    print("\n" + "=" * 72)
-    print(" Your free NVIDIA node is ready. In Maestro on your computer:")
-    print("   Models → Free NVIDIA GPU → paste this code → Connect\n")
-    print(code)
-    print("\n Keep this notebook running. The address changes every session: paste the new code next time.")
-    print("=" * 72 + "\n", flush=True)
-
-    stop = {"now": False}
-    signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
+    apps = [APP]
+    if count > 1:
+        try:
+            apps.append(second_tree())
+            place_storage(info["storage"], apps[1])
+        except (subprocess.SubprocessError, OSError) as error:
+            log(f"Could not prepare the second node ({error}); running one node.")
+            count = 1
+    platform_label = {"kaggle": "Kaggle", "lightning": "Lightning AI"}.get(info["platform"], "Cloud")
+    processes: list[subprocess.Popen] = []
+    nodes = []
     try:
+        for index in range(count):
+            gpu = info["gpus"][index]
+            token = (args.token if index == 0 else "") or secrets.token_urlsafe(32)
+            try:
+                server, tunnel, url, _log_path = start_node(index, apps[index], index, PORT + index, token, python,
+                                                            info["storage"], args.startup_timeout)
+            except (cloud_node.CloudNodeError, OSError) as error:
+                log(str(error))
+                if index == 0:
+                    return 1
+                log("Continuing with one node.")
+                break
+            processes += [server, tunnel]
+            suffix = f" #{index + 1}" if count > 1 else ""
+            nodes.append({"url": url, "token": token, "label": f"{platform_label} {gpu['name']}{suffix}",
+                          "gpu": f"{gpu['name']} {gpu['memory_mb']} MiB"})
+        code = cloud_node.make_multi_code(nodes, expires_hint="until this notebook session ends")
+        with open(os.path.join(info["storage"], "maestro-connection-code.txt"), "w", encoding="utf-8") as handle:
+            handle.write(code + "\n")
+        print("\n" + "=" * 72)
+        print(f" Your free NVIDIA node{'s are' if len(nodes) > 1 else ' is'} ready ({len(nodes)} GPU). "
+              "In Maestro on your computer:")
+        print("   Auto → Free NVIDIA GPU → paste this code → Connect\n")
+        print(code)
+        print("\n Keep this notebook running. The address changes every session: paste the new code next time.")
+        print("=" * 72 + "\n", flush=True)
+
+        stop = {"now": False}
+        signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
         while not stop["now"]:
-            if server.poll() is not None:
-                log(f"Maestro stopped (exit {server.returncode}); see {log_path}.")
+            if any(process.poll() is not None for process in processes):
+                log("A node or its tunnel stopped; see the node logs in " + info["storage"]
+                    + ". Run this cell again for a new code.")
                 break
-            if tunnel.poll() is not None:
-                log("The tunnel closed; run this cell again for a new code.")
-                break
-            usage = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+            usage = subprocess.run(["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used",
                                     "--format=csv,noheader"], capture_output=True, text=True).stdout.strip()
-            log(f"alive · GPU {usage}")
+            log("alive · GPU " + usage.replace("\n", " | "))
             time.sleep(60)
     except KeyboardInterrupt:
         pass
     finally:
-        tunnel.terminate()
-        server.terminate()
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
     return 0
 
 

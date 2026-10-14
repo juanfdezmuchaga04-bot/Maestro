@@ -27,6 +27,7 @@ interface Peer {
 interface Status {
   platforms: Platform[]
   peer: Peer | null
+  peers?: Peer[]
   notebook: string
   script: string
 }
@@ -61,13 +62,14 @@ export function FreeGpuNode() {
     setBusy(true)
     setMessage(null)
     try {
-      const result = await call<{ online: boolean; peer: Peer }>('/api/v1/engines/free-gpu/connect', {
+      const result = await call<{ nodes: Array<{ online: boolean; peer: Peer }> }>('/api/v1/engines/free-gpu/connect', {
         method: 'POST',
         body: JSON.stringify({ code: code.trim() }),
       })
-      setMessage(result.online
-        ? { ok: true, text: `Connected to ${result.peer.label}. Studio and Films renders now go to this GPU.` }
-        : { ok: false, text: `Saved, but the node did not answer yet: ${result.peer.last_probe?.error || 'still starting?'}` })
+      const offline = result.nodes.filter(node => !node.online)
+      setMessage(offline.length === 0
+        ? { ok: true, text: `Connected to ${result.nodes.map(node => node.peer.label).join(' and ')}. Renders now go to ${result.nodes.length > 1 ? 'these GPUs (the least busy one first)' : 'this GPU'}.` }
+        : { ok: false, text: `Saved, but ${offline.map(node => node.peer.label).join(', ')} did not answer yet: ${offline[0].peer.last_probe?.error || 'still starting?'}` })
       setCode('')
       setReload(value => value + 1)
     } catch (error) {
@@ -77,7 +79,7 @@ export function FreeGpuNode() {
     }
   }
 
-  const peer = status?.peer
+  const peers = status?.peers || (status?.peer ? [status.peer] : [])
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4 text-xs text-text-secondary">
@@ -98,7 +100,7 @@ export function FreeGpuNode() {
             and import it in Kaggle (<em>Create → Notebook → File → Import notebook</em>).
           </li>
           <li>In Kaggle: <em>Settings → Accelerator → GPU T4 ×2</em> and <em>Internet → On</em> (phone-verified account).</li>
-          <li><em>Run all</em>. The first run installs PyTorch and Maestro (several minutes); the last cell prints a <code>maestro-node:…</code> code.</li>
+          <li><em>Run all</em>. The first run installs PyTorch and Maestro (several minutes); the last cell prints a <code>maestro-node:…</code> code. With <em>T4 ×2</em> it starts one Maestro per GPU and the single code connects both; renders and the SeedVR2 4K pass go to the least busy one. Both share the session&apos;s ~29 GB of RAM.</li>
           <li>Paste the code below and press Connect. Keep the notebook open while you render; stop it when you finish.</li>
         </ol>
       </section>
@@ -110,17 +112,18 @@ export function FreeGpuNode() {
             <RefreshCw size={12} />
           </button>
         </div>
-        {peer ? (
-          <p className={`mt-2 flex items-center gap-1 ${peer.online ? 'text-accent-green' : 'text-amber-400'}`}>
-            {peer.online && <CheckCircle2 size={12} />}
-            {peer.label} — {peer.online ? 'online' : 'offline (start the notebook again and paste its new code)'} · {peer.notes}
-          </p>
-        ) : (
-          <p className="mt-2 text-text-muted">No free GPU node connected yet.</p>
-        )}
-        {peer?.online && peer.capabilities.length > 0 && (
-          <p className="mt-1 text-[11px] text-text-muted">Can render: {peer.capabilities.join(', ')}</p>
-        )}
+        {peers.length === 0 && <p className="mt-2 text-text-muted">No free GPU node connected yet.</p>}
+        {peers.map(peer => (
+          <div key={peer.peer_id} className="mt-2">
+            <p className={`flex items-center gap-1 ${peer.online ? 'text-accent-green' : 'text-amber-400'}`}>
+              {peer.online && <CheckCircle2 size={12} />}
+              {peer.label} — {peer.online ? 'online' : 'offline (start the notebook again and paste its new code)'} · {peer.notes}
+            </p>
+            {peer.online && peer.capabilities.length > 0 && (
+              <p className="mt-0.5 text-[11px] text-text-muted">Can render: {peer.capabilities.join(', ')}</p>
+            )}
+          </div>
+        ))}
         <textarea
           value={code}
           onChange={event => setCode(event.target.value)}

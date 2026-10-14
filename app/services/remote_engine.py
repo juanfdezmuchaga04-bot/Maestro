@@ -148,6 +148,15 @@ MEDIA_PARAM_KEYS = (
     "audio_guide",
     "audio_guide2",
     "viggle_character",
+    # Director multi-clip renders: the soundtrack the clips are cut to and a
+    # cloned voice travel with the job like any other input.
+    "multi_clip_concat_audio",
+    "voice_reference",
+)
+
+# Parameters holding one list of paths per clip (Director keyframe injection).
+NESTED_MEDIA_PARAM_KEYS = (
+    "per_clip_keyframes",
 )
 
 MAX_JSON_BYTES = 4 * 1024 * 1024
@@ -1235,6 +1244,33 @@ def transfer_media(
             continue
         original = params.get(key)
         rewritten[key] = sent[0] if isinstance(original, str) else sent
+    uploaded: dict[str, str] = {}
+    for key in NESTED_MEDIA_PARAM_KEYS:
+        groups = params.get(key)
+        if groups is None:
+            continue
+        if not isinstance(groups, (list, tuple)) or not all(isinstance(g, (list, tuple)) for g in groups):
+            unsent.append((key, "it is not a list of path lists"))
+            continue
+        rebuilt: list[list[str]] = []
+        failed = False
+        for group in groups:
+            remote_group: list[str] = []
+            for entry in _media_entries(list(group)):
+                try:
+                    local_path, suffix = _resolve_local_media(entry)
+                    if local_path not in uploaded:
+                        uploaded[local_path] = client.upload_file(local_path, chunk_size=chunk_size, timeout=timeout)
+                except RemoteEngineError as error:
+                    unsent.append((key, str(error)[:200]))
+                    failed = True
+                    continue
+                remote_group.append(f"{uploaded[local_path]}{suffix}")
+            rebuilt.append(remote_group)
+        if not failed:
+            rewritten[key] = rebuilt
+            if callable(note) and uploaded:
+                note(f"Sent {len(uploaded)} keyframe image(s) to the remote computer.")
     return rewritten, unsent
 
 

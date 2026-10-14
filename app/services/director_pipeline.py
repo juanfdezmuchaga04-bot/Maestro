@@ -142,6 +142,20 @@ def _director_hardware_snapshot() -> dict:
         return {"gpu_vram_gb": 0.0}
 
 
+def _director_render_hardware(params: dict) -> dict:
+    """The GPU the video will be rendered on.
+
+    A computer without a GPU renders on a peer (for example a free notebook GPU),
+    so planning must size shots for *that* card.  ``render_hardware`` is set by
+    the automatic production from the peer the job is routed to; without it the
+    local measurement is used, as before.
+    """
+    declared = params.get("render_hardware") if isinstance(params, dict) else None
+    if isinstance(declared, dict) and float(declared.get("gpu_vram_gb") or 0) > 0:
+        return dict(declared)
+    return _director_hardware_snapshot()
+
+
 def _director_uses_fixed_media_strength(
     video_model: str,
     model_def: Optional[dict] = None,
@@ -382,7 +396,7 @@ def _create_director_video_execution_profile(
         video_model,
         model_def,
         profile_inputs,
-        hardware if hardware is not None else _director_hardware_snapshot(),
+        hardware if hardware is not None else _director_render_hardware(params),
         manual_max_frames=params.get("director_max_shot_frames"),
         resolution_preset=params.get("director_resolution_preset", ""),
         aspect_ratio=params.get("director_aspect_ratio", ""),
@@ -7989,6 +8003,10 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
         print(f"[Pipeline {pid}] Voice reference: {voice_ref}, identity_scale={gen_params['identity_guidance_scale']}")
     if spatial_upsampling:
         gen_params["spatial_upsampling"] = spatial_upsampling
+    temporal_upsampling = str(params.get("video_temporal_upsampling") or "")
+    if temporal_upsampling in {"rife2", "rife3", "rife4"}:
+        # RIFE frame interpolation after the render (24 -> 48/72/96 fps).
+        gen_params["temporal_upsampling"] = temporal_upsampling
     if film_grain_intensity > 0:
         gen_params["film_grain_intensity"] = film_grain_intensity
         gen_params["film_grain_saturation"] = film_grain_saturation

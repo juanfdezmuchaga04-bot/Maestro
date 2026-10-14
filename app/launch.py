@@ -581,7 +581,7 @@ def _init_pipeline():
         from services.director_pipeline import init as pipeline_init
         pipeline_init(
             _jobs,
-            _run_generation,
+            _run_director_generation,
             wgp,
             _gen_lock,
             _active_gen_states,
@@ -31643,7 +31643,21 @@ def _generation_route(params: dict, *, force_local: bool = False) -> dict:
         peers=peers,
         request_params=params,
         public_sources=_public_sources(),
+        peer_load=_delegated_peer_load(),
     )
+
+
+def _delegated_peer_load() -> dict:
+    """How many of this computer's jobs each peer is rendering or about to render."""
+    load: dict = {}
+    for job in list(_jobs.values()):
+        if str(job.get("status") or "") not in {"queued", "running"}:
+            continue
+        route = job.get("_generation_route") or {}
+        peer_id = str(route.get("peer_id") or "")
+        if peer_id and route.get("target") == engine_routing_service.REMOTE_TARGET:
+            load[peer_id] = load.get(peer_id, 0) + 1
+    return load
 
 
 def _public_sources() -> list[dict]:
@@ -31854,8 +31868,13 @@ def _delegated_queue_payload(job: dict, route: dict) -> dict:
     params["workspace"] = str(job.get("workspace") or "")
     params["public_provider"] = str(route.get("public_provider_id") or "")
     if route.get("target") != engine_routing_service.PUBLIC_TARGET:
+        # A job that already names the peer engine it needs (the 4K finishing
+        # pass asks for FINISH_ENGINE) keeps it; everything else asks for the
+        # peer's own Maestro engine.
         params["remote_engine"] = str(
-            route.get("remote_engine") or engine_routing_service.REMOTE_ENGINE
+            params.get("remote_engine")
+            or route.get("remote_engine")
+            or engine_routing_service.REMOTE_ENGINE
         )
     return {
         "project_id": str(params.get("project_id") or ""),
@@ -32072,6 +32091,30 @@ def _run_public_generation(job_id: str) -> None:
     _hand_over_to_queue(job, route, label)
 
 
+def _run_director_generation(job_id: str, **kwargs) -> bool:
+    """Run one Director child job here, or on the computer that can.
+
+    Director used to call the local engine directly, so a computer without a CUDA
+    GPU could plan a film but never render it.  Now the same routing as Studio
+    decides: this GPU when there is one, otherwise a peer (for example a free
+    notebook GPU connected from Models -> Free NVIDIA GPU) or a free public engine.
+    The call blocks until the job finished, as Director's waiter expects.
+    """
+    job = _jobs.get(job_id)
+    if job is None:
+        return False
+    if _local_generation_possible() or kwargs:
+        return _run_generation(job_id, **kwargs)
+    route = _generation_route(job.get("params") or {})
+    job["_generation_route"] = route
+    if route.get("target") == engine_routing_service.NO_TARGET:
+        finish_job(job, "failed", error=str(route.get("reason") or "No engine can run this job"),
+                   message="No engine to run this job", phase="")
+        return False
+    _run_generation_job_now(job_id)
+    return str((_jobs.get(job_id) or {}).get("status") or "") == "completed"
+
+
 def _run_generation_job_now(job_id: str) -> None:
     """Run one Studio job here, or delegate it — blocking, for serial dispatchers."""
     job = _jobs.get(job_id)
@@ -32220,6 +32263,53 @@ def _register_public_generation_queue_handler(_app=None) -> None:
         print(f"[Public compute] Could not register the queue runners: {error}")
 
 
+def _run_queued_finishing_locally(job, context) -> list:
+    """Upscale a delegated finished video with SeedVR2 on this computer's GPU.
+
+    Registered for ``engine_routing.FINISH_ENGINE``.  The video arrives as
+    ``video_guide`` (sent by the delegating computer like any other media) and the
+    upscaled file — with the original audio — is the job's only artifact.
+    """
+    import subprocess
+
+    from services import seedvr2_upscaler
+    from services.queue_worker import JobCancelled
+
+    if not _local_generation_possible():
+        context.fail("This computer has no CUDA GPU in this process, so it cannot run SeedVR2.",
+                     retryable=False)
+        return []
+    params = dict(job.get("params") or {})
+    source = str(params.get("video_guide") or "")
+    resolution = str(params.get("finish_resolution") or "4k")
+    try:
+        vram = float((_get_cached_hardware() or {}).get("gpu_vram_gb") or 0)
+    except Exception:  # noqa: BLE001 - a failed probe means "unknown", reported below
+        vram = 0.0
+    out_dir = os.path.abspath(os.path.join(_workspace_dir(str(params.get("workspace") or "")), "finished"))
+    stem = os.path.splitext(os.path.basename(source))[0] or "video"
+    output = os.path.join(out_dir, f"{stem}_seedvr2_{resolution}.mp4")
+
+    def progress(done: int, total: int, note: str) -> None:
+        context.report(percent=int(done * 100 / total), step=done, total_steps=total, note=note)
+
+    try:
+        path = seedvr2_upscaler.upscale(
+            source, output, resolution=resolution, vram_gb=vram, app_dir=os.path.dirname(os.path.abspath(__file__)),
+            on_progress=progress, cancelled=context.cancelled,
+            log=lambda text: context.report(note=str(text)[:200]),
+        )
+    except seedvr2_upscaler.SeedVR2Error as error:
+        if context.cancelled():
+            raise JobCancelled("Cancelled while upscaling") from error
+        context.fail(str(error)[:400], retryable=False)
+        return []
+    except (OSError, subprocess.SubprocessError) as error:
+        context.fail(f"{type(error).__name__}: {error}"[:400], retryable=True)
+        return []
+    return [os.path.abspath(path)]
+
+
 def _register_local_generation_queue_handler(_app=None) -> None:
     """Let another Maestro render a Studio/Films request on this machine's GPU."""
     try:
@@ -32228,6 +32318,11 @@ def _register_local_generation_queue_handler(_app=None) -> None:
         queue_worker_service.register_handler(
             engine_routing_service.REMOTE_ENGINE,
             _run_queued_generation_locally,
+            replace=True,
+        )
+        queue_worker_service.register_handler(
+            engine_routing_service.FINISH_ENGINE,
+            _run_queued_finishing_locally,
             replace=True,
         )
         print(
@@ -32429,13 +32524,14 @@ async def remote_peers_add(request: Request):
 
 @api.get("/api/v1/engines/free-gpu")
 def free_gpu_status():
-    """The free NVIDIA notebook platforms and the node connected from one, if any."""
+    """The free NVIDIA notebook platforms and the nodes connected from one, if any."""
     from services import cloud_node as cloud_node_service
 
     root = _remote_peers_root()
-    peer = next((p for p in remote_engine_service.list_peers(root)
-                 if p.get("peer_id") == cloud_node_service.PEER_ID), None)
-    return {"platforms": cloud_node_service.PLATFORMS, "peer": peer,
+    wanted = [cloud_node_service.peer_id_for(i) for i in range(cloud_node_service.MAX_NODES)]
+    by_id = {p.get("peer_id"): p for p in remote_engine_service.list_peers(root)}
+    peers = [by_id[peer_id] for peer_id in wanted if peer_id in by_id]
+    return {"platforms": cloud_node_service.PLATFORMS, "peer": peers[0] if peers else None, "peers": peers,
             "notebook": "cloud/maestro_free_gpu_node.ipynb",
             "script": "scripts/maestro_cloud_node.py"}
 
@@ -32464,25 +32560,205 @@ async def free_gpu_connect(request: Request):
 
     body = await request.json()
     try:
-        node = cloud_node_service.parse_code(str((body or {}).get("code") or ""))
+        nodes = cloud_node_service.parse_nodes(str((body or {}).get("code") or ""))
     except cloud_node_service.CloudNodeError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     try:
         root = _remote_peers_root()
-        record = remote_engine_service.add_peer(root, {
-            "peer_id": cloud_node_service.PEER_ID, "label": node["label"], "base_url": node["url"],
-            "token": node["token"], "engine": engine_routing_service.REMOTE_ENGINE,
-            "notes": f"{node['gpu']} - {node['expires']}",
-        })
-        registered = remote_engine_service.register_remote_handlers(
-            peers_root=root, out_dir=_delegation_out_dir, engines=(record["engine_id"],)
-        )
-        probe = await asyncio.to_thread(remote_engine_service.probe_peer, root, record["peer_id"], timeout=30)
+        known = {p.get("peer_id") for p in remote_engine_service.list_peers(root)}
+        # A session with fewer GPUs than the last one: forget the extra node, its
+        # address died with that session.
+        for index in range(len(nodes), cloud_node_service.MAX_NODES):
+            stale = cloud_node_service.peer_id_for(index)
+            if stale in known:
+                remote_engine_service.remove_peer(root, stale)
+                remote_engine_service.unregister_remote_handlers((f"{remote_engine_service.ENGINE_PREFIX}:{stale}",))
+        results, registered = [], []
+        for index, node in enumerate(nodes):
+            record = remote_engine_service.add_peer(root, {
+                "peer_id": cloud_node_service.peer_id_for(index), "label": node["label"], "base_url": node["url"],
+                "token": node["token"], "engine": engine_routing_service.REMOTE_ENGINE,
+                "notes": f"{node['gpu']} - {node['expires']}",
+            })
+            registered += remote_engine_service.register_remote_handlers(
+                peers_root=root, out_dir=_delegation_out_dir, engines=(record["engine_id"],)
+            )
+            probe = await asyncio.to_thread(remote_engine_service.probe_peer, root, record["peer_id"], timeout=30)
+            results.append({"peer": probe.get("peer") or record, "online": bool(probe.get("online")),
+                            "probe": probe.get("probe")})
         worker = queue_worker_service.start_worker(_film_queue_root(), worker="local", interval=2.0)
     except Exception as error:
         raise _remote_http_error(error) from error
-    return {"peer": probe.get("peer") or record, "online": bool(probe.get("online")), "probe": probe.get("probe"),
+    first = results[0]
+    return {"peer": first["peer"], "online": first["online"], "probe": first["probe"], "nodes": results,
             "registered": registered, "worker": worker}
+
+
+# ----------------------------------------------------------------------------
+# Automatic production: description + images → Director → node(s) → upscale → video
+# ----------------------------------------------------------------------------
+
+_auto_conductor_instance = None
+_auto_conductor_lock = threading.Lock()
+
+
+def _auto_production_compute(probe: bool = True) -> dict:
+    """The GPUs a production can use right now: this computer's and the online nodes.
+
+    ``probe`` re-asks a node whose last probe expired (before starting work); the
+    status screen, which refreshes often, reads the last known state instead.
+    """
+    from services import cloud_node as cloud_node_service
+
+    local = 0.0
+    if _local_generation_possible():
+        try:
+            local = float((_get_cached_hardware() or {}).get("gpu_vram_gb") or 0) or 1.0
+        except Exception:  # noqa: BLE001 - a GPU that renders but reports no size still counts
+            local = 1.0
+    root = _remote_peers_root()
+    nodes = []
+    for peer in remote_engine_service.list_peers(root):
+        if str(peer.get("engine") or engine_routing_service.REMOTE_ENGINE) != engine_routing_service.REMOTE_ENGINE:
+            continue
+        if probe and not peer.get("online"):
+            # The last probe has expired; ask once more before declaring it gone.
+            try:
+                probe = remote_engine_service.probe_peer(root, str(peer["peer_id"]), timeout=15)
+                peer = probe.get("peer") or peer
+            except Exception:  # noqa: BLE001 - an unreachable node is simply offline
+                pass
+        nodes.append({"peer_id": peer.get("peer_id"), "label": peer.get("label"), "online": bool(peer.get("online")),
+                      "vram_gb": cloud_node_service.gpu_memory_gb(str(peer.get("notes") or ""))})
+    return {"local_vram_gb": local, "nodes": nodes}
+
+
+def _auto_production_finish(source: str, resolution: str, report, cancelled) -> str:
+    """SeedVR2 on this computer's GPU, or on the least busy online node."""
+    from services import generation_queue as queue_service
+    from services import seedvr2_upscaler
+
+    out = os.path.join(os.path.dirname(source), f"{os.path.splitext(os.path.basename(source))[0]}_{resolution}.mp4")
+    compute = _auto_production_compute()
+    if compute["local_vram_gb"] >= 8:
+        return seedvr2_upscaler.upscale(
+            source, out, resolution=resolution, vram_gb=compute["local_vram_gb"], app_dir=_app_dir,
+            on_progress=lambda done, total, note: report(int(done * 100 / total), note), cancelled=cancelled,
+            log=lambda text: report(None, text),
+        )
+    load = _delegated_peer_load()
+    nodes = sorted((n for n in compute["nodes"] if n["online"]), key=lambda n: load.get(str(n["peer_id"]), 0))
+    if not nodes:
+        raise RuntimeError("No GPU is available for the SeedVR2 pass: the node went offline.")
+    node = nodes[0]
+    root = _film_queue_root()
+    submitted = queue_service.submit(root, {
+        "task": "video", "engine": f"{remote_engine_service.ENGINE_PREFIX}:{node['peer_id']}",
+        "model": "seedvr2", "memory_mb": 0, "cancel_supported": True,
+        "dedupe_key": f"finish:{source}:{resolution}",
+        "params": {"video_guide": source, "finish_resolution": resolution,
+                   "remote_engine": engine_routing_service.FINISH_ENGINE},
+    })
+    queue_job_id = str((submitted.get("job") or {}).get("job_id") or "")
+    if not queue_job_id:
+        raise RuntimeError("The queue did not accept the SeedVR2 job.")
+    _ensure_delegation_worker()
+    report(0, f"SeedVR2 on {node['label']} (queue job {queue_job_id})")
+    last = None
+    while True:
+        if cancelled():
+            queue_service.cancel(root, queue_job_id, reason="Automatic production cancelled")
+            raise RuntimeError("Cancelled")
+        record = queue_service.job(root, queue_job_id)
+        state = str(record.get("state") or "")
+        progress = record.get("progress") or {}
+        now = (progress.get("percent"), progress.get("note"))
+        if now != last:
+            last = now
+            report(progress.get("percent"), str(progress.get("note") or state))
+        if state == "completed":
+            files = [path for path in record.get("outputs") or [] if os.path.isfile(path)]
+            if not files:
+                raise RuntimeError("SeedVR2 finished on the node but no file came back.")
+            return files[0]
+        if state in {"failed", "cancelled"}:
+            raise RuntimeError(f"SeedVR2 on {node['label']} {state}: {(record.get('errors') or ['no reason given'])[-1]}")
+        time.sleep(3)
+
+
+def _auto_conductor():
+    global _auto_conductor_instance
+    from services import auto_production
+    from services import director_pipeline as director_pipeline_service
+
+    with _auto_conductor_lock:
+        if _auto_conductor_instance is None:
+            base = wgp.server_config.get("save_path", "outputs")
+
+            def start(params: dict) -> str:
+                _init_pipeline()
+                return director_pipeline_service.start_pipeline(params)
+
+            _auto_conductor_instance = auto_production.Conductor(
+                os.path.abspath(base),
+                compute=_auto_production_compute,
+                start_pipeline=start,
+                pipeline_status=lambda pid: director_pipeline_service.get_pipeline_status(pid, base),
+                stop_pipeline=director_pipeline_service.stop_pipeline,
+                finish=_auto_production_finish,
+            )
+        return _auto_conductor_instance
+
+
+def _public_production(state: dict | None) -> dict:
+    if not state:
+        raise HTTPException(status_code=404, detail="Production not found")
+    public = dict(state)
+    public["result_name"] = os.path.basename(str(state.get("result") or ""))
+    return public
+
+
+@api.get("/api/v1/auto-production")
+async def auto_production_list():
+    conductor = _auto_conductor()
+    try:
+        compute = await asyncio.to_thread(_auto_production_compute, False)
+    except Exception as error:  # noqa: BLE001 - shown to the user as is
+        compute = {"error": str(error)[:300]}
+    return {"productions": [_public_production(s) for s in conductor.list_all()][:30], "compute": compute}
+
+
+@api.post("/api/v1/auto-production")
+async def auto_production_start(request: Request):
+    from services import auto_production
+
+    body = await request.json()
+    try:
+        state = await asyncio.to_thread(_auto_conductor().start, body or {})
+    except auto_production.AutoProductionError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return _public_production(state)
+
+
+@api.get("/api/v1/auto-production/{production_id}")
+def auto_production_get(production_id: str):
+    return _public_production(_auto_conductor().get(production_id))
+
+
+@api.post("/api/v1/auto-production/{production_id}/cancel")
+def auto_production_cancel(production_id: str):
+    return _public_production(_auto_conductor().cancel(production_id))
+
+
+@api.get("/api/v1/auto-production/{production_id}/video")
+def auto_production_video(production_id: str):
+    from fastapi.responses import FileResponse
+
+    state = _auto_conductor().get(production_id) or {}
+    path = str(state.get("result") or state.get("director_video") or "")
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="This production has no video yet")
+    return FileResponse(path, media_type="video/mp4", filename=os.path.basename(path))
 
 
 @api.patch("/api/v1/engines/remote/peers/{peer_id}")

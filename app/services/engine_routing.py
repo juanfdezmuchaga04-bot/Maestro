@@ -70,6 +70,9 @@ LOCAL_ENGINE = "local:maestro"
 # ``params.remote_engine``, so a peer that is used for ComfyUI work by hand keeps
 # its own default.
 REMOTE_ENGINE = "maestro"
+# The engine a peer registers for *finishing* a finished video (SeedVR2 upscale to
+# 1440p/4K).  It is asked for by name; Studio requests never route to it.
+FINISH_ENGINE = "maestro-finish"
 
 # ``node:<peer_id>`` — the queue engine string a delegated job carries.
 PEER_ENGINE_PREFIX = "node"
@@ -133,6 +136,9 @@ LOCAL_MEDIA_PARAMS = (
     "audio_guide",
     "audio_guide2",
     "viggle_character",
+    "multi_clip_concat_audio",
+    "voice_reference",
+    "per_clip_keyframes",
 )
 
 
@@ -279,6 +285,7 @@ def choose_target(
     peers: Sequence[Mapping[str, Any]],
     request_params: Optional[Mapping[str, Any]] = None,
     public_sources: Sequence[Mapping[str, Any]] = (),
+    peer_load: Optional[Mapping[str, int]] = None,
 ) -> dict[str, Any]:
     """Pick the engine that will run this request.
 
@@ -405,7 +412,11 @@ def choose_target(
         if capability
         else renderers
     )
-    chosen = exact[0]
+    # Several computers can render (for example the two GPUs of one free notebook):
+    # give the job to the one with the fewest jobs of ours in flight, keeping the
+    # configured order as the tie-break, so independent jobs run side by side.
+    load = peer_load if isinstance(peer_load, Mapping) else {}
+    chosen = min(exact, key=lambda peer: (int(load.get(str(peer.get("peer_id")), 0) or 0), exact.index(peer)))
     return result(
         REMOTE_TARGET,
         engine=f"{PEER_ENGINE_PREFIX}:{chosen.get('peer_id')}",

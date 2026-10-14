@@ -4,6 +4,9 @@ Investigación del **2026-10-14**. Cada dato lleva su fuente al final; lo que no
 medido en un equipo real se marca como estimación. Hay tres palancas independientes:
 **resolución**, **duración** y **dónde se calcula**.
 
+> Lo recomendado aquí (Director + nodos + FlashVSR/SeedVR2 + RIFE) ya está integrado y es
+> automático: ver [Producción automática](PRODUCCION-AUTOMATICA.md).
+
 ## 1. Lo que Maestro ya tiene (no hay que añadir nada)
 
 | Capacidad | Qué hace | Requisito |

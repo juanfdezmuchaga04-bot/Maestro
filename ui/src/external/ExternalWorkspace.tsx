@@ -15,6 +15,7 @@ import {
 import { AppModeToggle, MaestroBrand } from '../components/AppModeNavigation'
 import { ModelLibrary } from './ModelLibrary'
 import { FreeGpuNode } from './FreeGpuNode'
+import { AutoProduction } from './AutoProduction'
 import { useStore } from '../stores/useStore'
 import {
   ExternalApiError,
@@ -357,7 +358,7 @@ export function ExternalWorkspace() {
   const [quote, setQuote] = useState<ExternalQuote | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
-  const [tab, setTab] = useState<'library' | 'cloud' | 'gpu'>('library')
+  const [tab, setTab] = useState<'auto' | 'library' | 'cloud' | 'gpu'>('auto')
 
   const refresh = useCallback(async () => {
     try {
@@ -475,11 +476,11 @@ export function ExternalWorkspace() {
       <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border bg-bg-secondary px-3 py-2">
         <MaestroBrand compact />
         <div className="leading-tight">
-          <div className="text-sm font-semibold text-text-primary">Models &amp; cloud</div>
-          <div className="text-[10px] text-text-muted">Model library, downloads and opt-in cloud generation</div>
+          <div className="text-sm font-semibold text-text-primary">Auto &amp; models</div>
+          <div className="text-[10px] text-text-muted">Automatic production, model library, free GPU nodes and opt-in cloud generation</div>
         </div>
         <div className="flex rounded-lg border border-border bg-bg-tertiary p-0.5" role="tablist">
-          {([['library', 'Model library'], ['gpu', 'Free NVIDIA GPU'], ['cloud', 'Cloud generation']] as const).map(([id, label]) => (
+          {([['auto', 'Auto production'], ['library', 'Model library'], ['gpu', 'Free NVIDIA GPU'], ['cloud', 'Cloud generation']] as const).map(([id, label]) => (
             <button
               key={id}
               type="button"
@@ -505,7 +506,7 @@ export function ExternalWorkspace() {
         </div>
       </header>
 
-      {tab === 'library' ? <ModelLibrary /> : tab === 'gpu' ? <FreeGpuNode /> : (
+      {tab === 'auto' ? <AutoProduction /> : tab === 'library' ? <ModelLibrary /> : tab === 'gpu' ? <FreeGpuNode /> : (
       <div className="grid min-h-0 flex-1 gap-4 overflow-y-auto p-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
         <div className="flex min-w-0 flex-col gap-4">
           {loadError && <p className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-300">{loadError}</p>}
