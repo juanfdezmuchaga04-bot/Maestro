@@ -158,22 +158,49 @@ token solo se envía a `huggingface.co`, nunca al CDN al que redirige.
 - Ejecución de modelos en AMD, Apple o CPU: pendiente de medir en el equipo real (ver
   [DIAGNOSTICO-AMD-S145.md](DIAGNOSTICO-AMD-S145.md)).
 
-## La vía «idéntica a NVIDIA» y por qué está pendiente
+## La vía «idéntica a NVIDIA»: nodo GPU gratuito (Kaggle / Lightning)
 
 La única forma de obtener **exactamente** los resultados del motor de Maestro sin
-tener una NVIDIA es que ese motor se ejecute en una NVIDIA de otro sitio. Maestro ya
-sabe delegar un render a otro Maestro (*peer*, ver [STUDIO-NODES.md](STUDIO-NODES.md)).
-Se preparó un **nodo GPU gratuito**: un script y un cuaderno que instalan Maestro en la
-T4 gratuita de Kaggle o Lightning, lo arrancan protegido por token, lo publican con un
-túnel HTTPS de Cloudflare (TryCloudflare) y muestran un código para conectarlo a tu
-portátil. **No se ha incorporado** al repositorio: exponer un servidor a Internet
-mediante un túnel es una acción que el entorno de desarrollo exige aprobar
-expresamente, y además los términos de Kaggle no mencionan los túneles (zona gris;
-Colab gratuito los prohíbe). Queda a tu decisión.
+tener una NVIDIA es ejecutar ese motor en una NVIDIA de otro sitio. Maestro ya delega
+renders en otro Maestro (*peer*, ver [STUDIO-NODES.md](STUDIO-NODES.md)); el **nodo GPU
+gratuito** convierte una sesión gratuita de cuaderno en ese peer.
 
-Mientras tanto, la alternativa sin túnel es usar esas GPU gratuitas **dentro del
-propio cuaderno** (ejecutar allí el modelo y descargar el resultado) o conectar un
-ordenador tuyo con GPU por Tailscale, como ya documenta Maestro.
+1. Maestro → **Models → Free NVIDIA GPU** → descarga `maestro_free_gpu_node.ipynb`
+   (también en `cloud/` del repositorio).
+2. Kaggle → *Create → Notebook → File → Import notebook*. *Settings → Accelerator →
+   GPU T4 ×2* e *Internet → On* (cuenta verificada por teléfono).
+3. *Run all*. `scripts/maestro_cloud_node.py`:
+   - mide GPU, versión CUDA del driver y discos (`--check` solo mide);
+   - crea un entorno Python 3.11 aislado con `uv` e instala la build de PyTorch que
+     usa el lanzador de Maestro y que admite ese driver (CUDA 13 → torch 2.10;
+     12.8 → torch 2.7.1; P100 o driver 12.6 → torch 2.7.1 cu126) y `app/requirements.txt`;
+   - pone `app/ckpts` y la caché de Hugging Face en el disco con más espacio;
+   - arranca `app/launch.py` en modo token (`MAESTRO_ACCESS_TOKEN` aleatorio por
+     sesión, escuchando solo en 127.0.0.1);
+   - abre un túnel HTTPS de TryCloudflare (sin cuenta) hacia ese puerto;
+   - arranca la cola del nodo e imprime un código `maestro-node:…`.
+4. Pega el código en **Free NVIDIA GPU → Connect**. Maestro registra el peer
+   `free-gpu` con el motor `maestro` (el pipeline real de Studio/Films), lo sondea y
+   arranca la cola local. Desde entonces el enrutado envía los renders a esa GPU y
+   trae los archivos de vuelta. Cada sesión nueva da una dirección nueva: pega el
+   nuevo código (sustituye al anterior).
+
+**Seguridad:** el servidor del cuaderno solo acepta el token de esa sesión (modo
+token de `access_gate`); el código contiene ese token, así que no lo compartas. El
+túnel desaparece al parar el cuaderno.
+
+**Condiciones:** Kaggle limita a uso personal y no comercial y prohíbe la minería; no
+menciona los túneles (zona gris): úsalo de forma personal y con la pestaña abierta.
+Lightning AI admite servir puertos desde un Studio. **Colab gratuito no se puede usar**:
+sus términos prohíben servir una interfaz web desde el cuaderno (el script se niega).
+
+**Probado / no probado:** 7 pruebas (`tests/test_cloud_node.py`) cubren la lectura de
+`nvidia-smi`, la elección de PyTorch, la elección de disco, la detección de la URL del
+túnel, el código de conexión, que el cuaderno no lleve un token fijo y que el script
+se niegue sin GPU. **No se ha ejecutado en Kaggle**: este entorno no tiene GPU ni red
+hacia Kaggle. La instalación de los requisitos de Maestro en el Python de Kaggle, el
+tiempo de arranque y qué modelos caben en la T4 con su RAM quedan por medir en la
+primera sesión real.
 
 ## Anexo: los 224 modelos
 

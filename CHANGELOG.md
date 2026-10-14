@@ -8,6 +8,18 @@ pipeline's own history lives in [app/docs/CHANGELOG.md](app/docs/CHANGELOG.md).
 Production readiness for driving Maestro from a phone, free public compute for
 machines with no GPU, and an integrity fix for cached model receipts.
 
+- **Free NVIDIA GPU node.** `scripts/maestro_cloud_node.py` and
+  `cloud/maestro_free_gpu_node.ipynb` turn a free Kaggle (T4 ×2, ≈ 30 GPU-hours a
+  week) or Lightning AI notebook session into a peer that runs this same Maestro:
+  an isolated Python 3.11 environment with the PyTorch build the driver supports,
+  Maestro in token mode on 127.0.0.1, a TryCloudflare HTTPS tunnel and a
+  `maestro-node:` connection code. **Models → Free NVIDIA GPU** downloads the
+  notebook and connects the code (`POST /api/v1/engines/free-gpu/connect`), which
+  registers peer `free-gpu` with engine `maestro`, probes it and starts the local
+  queue, so Studio and Films renders run on the real pipeline there. Google Colab's
+  free tier is refused because its terms disallow serving a web UI. Not yet run on
+  Kaggle.
+
 - **More free cloud image models.** The Cloud mode adds FLUX.2 [klein] 4B and 9B on
   Cloudflare Workers AI (multipart requests, cost shown in Neurons per output tile;
   the 9B's non-commercial licence is in the disclosure) and a new opt-in provider,

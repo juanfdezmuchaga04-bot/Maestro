@@ -32427,6 +32427,64 @@ async def remote_peers_add(request: Request):
         raise _remote_http_error(error) from error
 
 
+@api.get("/api/v1/engines/free-gpu")
+def free_gpu_status():
+    """The free NVIDIA notebook platforms and the node connected from one, if any."""
+    from services import cloud_node as cloud_node_service
+
+    root = _remote_peers_root()
+    peer = next((p for p in remote_engine_service.list_peers(root)
+                 if p.get("peer_id") == cloud_node_service.PEER_ID), None)
+    return {"platforms": cloud_node_service.PLATFORMS, "peer": peer,
+            "notebook": "cloud/maestro_free_gpu_node.ipynb",
+            "script": "scripts/maestro_cloud_node.py"}
+
+
+@api.get("/api/v1/engines/free-gpu/notebook")
+def free_gpu_notebook():
+    """The Kaggle / Lightning notebook that turns a free NVIDIA session into this computer's node."""
+    from fastapi.responses import FileResponse
+
+    path = os.path.join(os.path.dirname(_app_dir), "cloud", "maestro_free_gpu_node.ipynb")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Notebook not found in this installation")
+    return FileResponse(path, media_type="application/x-ipynb+json", filename="maestro_free_gpu_node.ipynb")
+
+
+@api.post("/api/v1/engines/free-gpu/connect")
+async def free_gpu_connect(request: Request):
+    """Register the node a notebook printed (``maestro-node:...``) as this computer's GPU peer.
+
+    The peer runs Maestro's own engine (engine ``maestro``), so Studio and Films renders
+    sent there are the real pipeline on an NVIDIA GPU.  Re-connecting with a new
+    session's code replaces the previous address and token.
+    """
+    from services import cloud_node as cloud_node_service
+    from services import queue_worker as queue_worker_service
+
+    body = await request.json()
+    try:
+        node = cloud_node_service.parse_code(str((body or {}).get("code") or ""))
+    except cloud_node_service.CloudNodeError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    try:
+        root = _remote_peers_root()
+        record = remote_engine_service.add_peer(root, {
+            "peer_id": cloud_node_service.PEER_ID, "label": node["label"], "base_url": node["url"],
+            "token": node["token"], "engine": engine_routing_service.REMOTE_ENGINE,
+            "notes": f"{node['gpu']} - {node['expires']}",
+        })
+        registered = remote_engine_service.register_remote_handlers(
+            peers_root=root, out_dir=_delegation_out_dir, engines=(record["engine_id"],)
+        )
+        probe = await asyncio.to_thread(remote_engine_service.probe_peer, root, record["peer_id"], timeout=30)
+        worker = queue_worker_service.start_worker(_film_queue_root(), worker="local", interval=2.0)
+    except Exception as error:
+        raise _remote_http_error(error) from error
+    return {"peer": probe.get("peer") or record, "online": bool(probe.get("online")), "probe": probe.get("probe"),
+            "registered": registered, "worker": worker}
+
+
 @api.patch("/api/v1/engines/remote/peers/{peer_id}")
 async def remote_peers_update(peer_id: str, request: Request):
     body = await request.json()

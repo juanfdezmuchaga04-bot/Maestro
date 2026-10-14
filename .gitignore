@@ -121,3 +121,6 @@ app/dlss5/
 !docs/development/
 docs/development/*
 !docs/development/wan2gp-12-71-port-plan.md
+
+# Free GPU node (scripts/maestro_cloud_node.py) isolated environment
+.node-venv/
