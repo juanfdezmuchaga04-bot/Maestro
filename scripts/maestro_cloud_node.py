@@ -205,6 +205,11 @@ def second_tree() -> str:
     """A git worktree of this checkout for the second node (separate settings and queue)."""
     if not os.path.isdir(SECOND_TREE):
         run(["git", "-C", ROOT, "worktree", "add", "--detach", SECOND_TREE, "HEAD"])
+    else:
+        # A re-run after `git pull` must not leave the second node on older code.
+        run(["git", "-C", SECOND_TREE, "checkout", "--detach", "--force",
+             subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True, text=True,
+                            check=True).stdout.strip()])
     return os.path.join(SECOND_TREE, "app")
 
 
@@ -212,7 +217,10 @@ def start_node(index: int, app: str, gpu_index: int, port: int, token: str, pyth
                timeout: float) -> tuple[subprocess.Popen, subprocess.Popen, str, str]:
     """Start one Maestro on one GPU, wait for it, tunnel it and start its queue worker."""
     env = {**os.environ, "MAESTRO_ACCESS_TOKEN": token, "SERVER_NAME": "127.0.0.1", "SERVER_PORT": str(port),
-           "PYTHONUNBUFFERED": "1", "CUDA_VISIBLE_DEVICES": str(gpu_index)}
+           "PYTHONUNBUFFERED": "1", "CUDA_VISIBLE_DEVICES": str(gpu_index),
+           # Jupyter (Kaggle) exports its inline plotting backend, which only exists
+           # in the notebook's own Python; Maestro's environment needs a headless one.
+           "MPLBACKEND": "Agg"}
     log_path = os.path.join(storage, f"maestro-node-{index + 1}.log")
     log(f"Starting node {index + 1} on GPU {gpu_index}, port {port} (log: {log_path}). "
         "The first start imports the engine and can take several minutes.")
